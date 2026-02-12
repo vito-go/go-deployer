@@ -1,0 +1,4 @@
+github.com/vito-go/mylog v0.0.0-20260115231751-388ee139a527 h1:HTU6TwvETum9dOvgGsXw2N8w9LghNm+Wg556uZG5vek=
+github.com/vito-go/mylog v0.0.0-20260115231751-388ee139a527/go.mod h1:ZLYcztIrleHV+nzrSzlxa4oiLWrL+n2MnTlaoAe7iMw=
+gopkg.in/natefinch/lumberjack.v2 v2.2.1 h1:bBRl1b0OH9s/DuPhuXpNl+VtCaJXFZ5/uEFST95x9zc=
+gopkg.in/natefinch/lumberjack.v2 v2.2.1/go.mod h1:YD8tP3GAjkrDg1eZH7EGmyESg/lsYskCTPBJVb9jqSc=

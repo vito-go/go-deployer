@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Frontend Build Console</title>
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono&display=swap" rel="stylesheet">
+    <script>
+        tailwind.config = {darkMode: 'class'}
+    </script>
+    <style>
+        .mono {
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        .custom-scrollbar::-webkit-scrollbar {
+            width: 4px;
+        }
+
+        .custom-scrollbar::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+            background: #334155;
+            border-radius: 10px;
+        }
+
+        @keyframes spin {
+            from {
+                transform: rotate(0deg);
+            }
+            to {
+                transform: rotate(360deg);
+            }
+        }
+
+        .animate-spin {
+            animation: spin 1s linear infinite;
+        }
+
+        .terminal {
+            background-color: #000;
+            box-shadow: inset 0 0 10px rgba(0, 255, 0, 0.1);
+        }
+    </style>
+</head>
+<body class="transition-colors duration-500 bg-gray-50 dark:bg-slate-900 text-gray-900 dark:text-slate-100 min-h-screen">
+<div id="root"></div>
+
+<script type="text/babel">
+    const {useState, useEffect, useRef} = React;
+
+    // Get base path from current URL path, remove trailing slash if present
+    const BASE_PATH = window.location.pathname.replace(/\/$/, '');
+
+    function App() {
+        // --- 1. Theme Control ---
+        const [darkMode, setDarkMode] = useState(() => {
+            const saved = localStorage.getItem('theme');
+            return saved ? saved === 'dark' : true;
+        });
+
+        useEffect(() => {
+            document.documentElement.classList.toggle('dark', darkMode);
+            localStorage.setItem('theme', darkMode ? 'dark' : 'light');
+        }, [darkMode]);
+
+        // --- 2. State Management ---
+        const [buildInfo, setBuildInfo] = useState({
+            version: 'none',
+            branch: 'none',
+            builtAt: 'never',
+            buildDir: 'dist'
+        });
+        const [repoUrl, setRepoUrl] = useState('');
+        const [targetDir, setTargetDir] = useState('');
+        const [branches, setBranches] = useState([]);
+        const [selectedBranch, setSelectedBranch] = useState('');
+        const [commits, setCommits] = useState([]);
+        const [selectedCommit, setSelectedCommit] = useState('');
+
+        const [logs, setLogs] = useState([]);
+        const [showLogs, setShowLogs] = useState(false);
+        const [isBuilding, setIsBuilding] = useState(false);
+        const logEndRef = useRef(null);
+
+        useEffect(() => {
+            logEndRef.current?.scrollIntoView({behavior: "smooth"});
+        }, [logs]);
+
+        // --- 3. Data Loading ---
+        const fetchStatus = async () => {
+            try {
+                const res = await fetch(`${BASE_PATH}/status`);
+                const data = await res.json();
+                if (data) {
+                    setBuildInfo(data.buildInfo || {});
+                    setRepoUrl(data.repoUrl || '');
+                    setTargetDir(data.targetDir || '');
+                }
+            } catch (e) {
+                console.error("Status fetch failed");
+            }
+        };
+
+        const loadGitData = async () => {
+            try {
+                const bRes = await fetch(`${BASE_PATH}/git/branches`);
+                const bData = await bRes.json();
+                setBranches(bData || []);
+                if (bData?.length > 0) {
+                    const defaultBr = bData.includes('main') ? 'main' : bData[0];
+                    setSelectedBranch(defaultBr);
+                    fetchCommits(defaultBr);
+                }
+            } catch (e) {
+                console.error("Branches fetch failed");
+            }
+        };
+
+        const fetchCommits = async (br) => {
+            try {
+                const cRes = await fetch(`${BASE_PATH}/git/commits?branch=${br}`);
+                const cData = await cRes.json();
+                setCommits(cData || []);
+                if (cData?.length > 0) setSelectedCommit(cData[0].hash);
+            } catch (e) {
+                console.error("Commits fetch failed");
+            }
+        };
+
+        useEffect(() => {
+            fetchStatus();
+            loadGitData();
+            const timer = setInterval(fetchStatus, 3000);
+            return () => clearInterval(timer);
+        }, []);
+
+        // --- 4. Build Logic ---
+        const handleBuild = async () => {
+            if (!selectedCommit || isBuilding) return;
+            setIsBuilding(true);
+            setLogs(["[SYSTEM] Initializing build pipeline..."]);
+            setShowLogs(true);
+            const es = new EventSource(`${BASE_PATH}/build/logs`);
+            es.onmessage = (e) => {
+                if (e.data.startsWith("EOF") || e.data.startsWith("ERR")) {
+                    setLogs(prev => [...prev, e.data === "EOF" ? ">> BUILD SUCCESSFULLY" : ">> BUILD FAILED"]);
+                    es.close();
+                    setIsBuilding(false);
+                    setTimeout(fetchStatus, 2000);
+                    return;
+                }
+                setLogs(prev => [...prev, e.data]);
+            };
+            try {
+                await fetch(`${BASE_PATH}/build?branch=${selectedBranch}&commit=${selectedCommit}`, {method: 'POST'});
+            } catch (e) {
+                setLogs(prev => [...prev, "!! Network Error"]);
+                es.close();
+                setIsBuilding(false);
+            }
+        };
+
+        return (
+            <div className="max-w-6xl mx-auto p-4 md:p-12">
+                <header
+                    className="flex justify-between items-end mb-10 border-b border-gray-100 dark:border-slate-800 pb-6">
+                    <div>
+                        <div className="flex items-center gap-4">
+                            {/* 返回首页按钮 */}
+                            <a href="../" className="p-2 rounded-lg border border-gray-200 dark:border-slate-700 bg-white dark:bg-slate-800 hover:bg-gray-50 dark:hover:bg-slate-700 transition-all flex items-center gap-2 text-sm">
+                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10 19l-7-7m0 0l7-7m-7 7h18" />
+                                </svg>
+                                <span>Home</span>
+                            </a>
+                            <h1 className="text-3xl font-black text-green-600 italic tracking-tighter">Frontend Build</h1>
+                            {/* Repository Display */}
+                            <div
+                                className="px-3 py-1 bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-md shadow-inner flex items-center gap-2">
+                                <span
+                                    className="w-2 h-2 bg-green-500 rounded-full shadow-[0_0_8px_rgba(34,197,94,0.6)]"></span>
+                                <span
+                                    className="mono text-[12px] text-slate-500 dark:text-slate-400 font-medium select-all">
+                                    {repoUrl || 'Frontend repo loading...'}
+                                </span>
+                            </div>
+                        </div>
+                        <p className="mono text-[10px] opacity-40 uppercase tracking-[0.3em] mt-2 ml-1">Build & Deploy Frontend Assets</p>
+                    </div>
+                    <button
+                        type="button"
+                        onClick={() => setDarkMode(!darkMode)}
+                        className="p-2 w-10 h-10 rounded-full border border-gray-200 dark:border-slate-700 bg-white dark:bg-slate-800 flex items-center justify-center transition-all shadow-sm hover:scale-110"
+                    >
+                        {darkMode ? "☀️" : "🌙"}
+                    </button>
+                </header>
+
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-8 mb-8">
+                    {/* Left: Git Panel */}
+                    <div
+                        className="bg-white dark:bg-slate-800 border border-gray-200 dark:border-slate-700 p-6 rounded-2xl shadow-sm">
+                        <label className="text-[10px] font-bold text-green-500 uppercase mb-2 block tracking-wider">1.
+                            Select Branch</label>
+                        <select
+                            className="w-full bg-gray-50 dark:bg-slate-900 border border-gray-200 dark:border-slate-700 p-2 rounded mb-6 mono text-xs outline-none focus:border-green-500 transition-colors"
+                            value={selectedBranch}
+                            onChange={(e) => {
+                                setSelectedBranch(e.target.value);
+                                fetchCommits(e.target.value);
+                            }}
+                        >
+                            {branches?.map(b => <option key={b} value={b}>{b}</option>)}
+                        </select>
+
+                        <label className="text-[10px] font-bold text-green-500 uppercase mb-2 block tracking-wider">2.
+                            Select Commit</label>
+                        <div className="space-y-2 max-h-[350px] overflow-y-auto pr-2 custom-scrollbar">
+                            {commits?.map(c => (
+                                <div
+                                    key={c.hash}
+                                    onClick={() => setSelectedCommit(c.hash)}
+                                    className={`p-3 rounded-xl border cursor-pointer transition-all ${selectedCommit === c.hash ? 'border-green-500 bg-green-500/5 dark:bg-green-600/10' : 'border-transparent bg-gray-50 dark:bg-slate-900/40 hover:border-gray-200 dark:hover:border-slate-600'}`}
+                                >
+                                    <div className="flex justify-between mono mb-1">
+                                        <span className="text-green-600 font-bold text-[14px]">{c.hash}</span>
+                                        <span className="opacity-40 text-[12px]">{c.date}</span>
+                                    </div>
+                                    <div className="text-[12px] line-clamp-2 opacity-80 leading-snug">{c.msg}</div>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+
+                    {/* Right: Current Build Info */}
+                    <div
+                        className="lg:col-span-2 bg-white dark:bg-slate-800 border border-gray-200 dark:border-slate-700 rounded-2xl overflow-hidden shadow-sm">
+                        <div
+                            className="p-4 border-b border-gray-100 dark:border-slate-700 flex justify-between items-center">
+                            <span
+                                className="text-xs font-bold uppercase opacity-50 tracking-wide">Current Build</span>
+                            <span
+                                className="text-[10px] px-2 py-0.5 rounded bg-green-500/10 text-green-500 border border-green-500/20 mono">Target: {targetDir || 'worker/dist'}</span>
+                        </div>
+                        <div className="p-8">
+                            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                                {/* Version */}
+                                <div className="text-center">
+                                    <div className="text-[10px] font-bold uppercase opacity-40 mb-2 tracking-wider">Version</div>
+                                    <div className="mono text-lg font-bold text-green-600 bg-green-500/10 px-4 py-2 rounded-lg border border-green-500/20">
+                                        {buildInfo.version}
+                                    </div>
+                                </div>
+                                {/* Branch */}
+                                <div className="text-center">
+                                    <div className="text-[10px] font-bold uppercase opacity-40 mb-2 tracking-wider">Branch</div>
+                                    <div className="text-sm px-4 py-2 bg-slate-100 dark:bg-slate-700/50 rounded-lg border border-slate-200 dark:border-slate-600/50 mono">
+                                        {buildInfo.branch}
+                                    </div>
+                                </div>
+                                {/* Built At */}
+                                <div className="text-center">
+                                    <div className="text-[10px] font-bold uppercase opacity-40 mb-2 tracking-wider">Built At</div>
+                                    <div className="text-xs px-4 py-2 bg-slate-100 dark:bg-slate-700/50 rounded-lg border border-slate-200 dark:border-slate-600/50 mono italic">
+                                        {buildInfo.builtAt}
+                                    </div>
+                                </div>
+                            </div>
+
+                            {/* Build Info Description */}
+                            <div className="mt-6 p-4 bg-blue-50 dark:bg-blue-900/10 border border-blue-200 dark:border-blue-800 rounded-lg">
+                                <p className="text-xs text-blue-600 dark:text-blue-400 leading-relaxed">
+                                    <strong>Note:</strong> Building frontend will run <code className="mono bg-blue-100 dark:bg-blue-900/30 px-1 py-0.5 rounded">npm run build</code> and deploy the output to <code className="mono bg-blue-100 dark:bg-blue-900/30 px-1 py-0.5 rounded">worker/dist</code> directory. The Go backend will serve these static files.
+                                </p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                {showLogs && (
+                    <div className="mb-6 rounded-2xl overflow-hidden border border-slate-700 bg-black shadow-2xl">
+                        <div
+                            className="bg-slate-800 px-4 py-2 flex justify-between items-center border-b border-slate-700">
+                            <span className="mono text-[10px] text-slate-400">Terminal Output</span>
+                            <button type="button" onClick={() => setShowLogs(false)}
+                                    className="text-slate-500 hover:text-white text-xs">Close
+                            </button>
+                        </div>
+                        <div
+                            className="p-4 h-48 overflow-y-auto mono text-[11px] text-green-400 terminal custom-scrollbar whitespace-pre-wrap">
+                            {logs?.map((l, i) => <div key={i} className="mb-1">{l}</div>)}
+                            <div ref={logEndRef}/>
+                        </div>
+                    </div>
+                )}
+
+                <button
+                    type="button"
+                    onClick={handleBuild}
+                    disabled={isBuilding || !selectedCommit}
+                    className={`w-full py-5 rounded-2xl font-bold uppercase tracking-[0.2em] text-sm transition-all flex items-center justify-center gap-3 shadow-xl
+                        ${isBuilding || !selectedCommit ? 'bg-gray-300 dark:bg-slate-800 text-gray-500' : 'bg-green-600 hover:bg-green-500 text-white active:scale-[0.98]'}`}
+                >
+                    {isBuilding ? <div
+                            className="animate-spin h-5 w-5 border-2 border-white border-t-transparent rounded-full"></div> :
+                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2"
+                                  d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"/>
+                        </svg>}
+                    <span>{isBuilding ? "Building Frontend..." : `Build & Deploy to worker/dist`}</span>
+                </button>
+            </div>
+        );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App/>);
+</script>
+</body>
+</html>

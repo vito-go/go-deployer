@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Terminal</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #0a0a0a; height: 100vh; overflow: hidden; display: flex; flex-direction: column; }
+        #titlebar {
+            background: #1a1a1a; border-bottom: 1px solid #2a2a2a;
+            padding: 8px 16px; display: flex; align-items: center; justify-content: space-between;
+            flex-shrink: 0; font-family: -apple-system, sans-serif;
+        }
+        #titlebar .dots { display: flex; gap: 6px; }
+        #titlebar .dot { width: 12px; height: 12px; border-radius: 50%; }
+        #titlebar .info { font-size: 12px; color: #888; margin-left: 12px; }
+        #titlebar .status { font-size: 10px; color: #555; }
+        /* min-width/min-height:0 防止 flex child 撑开;overflow:hidden 避免滚动条干扰 fit 测量 */
+        #terminal-container { flex: 1; padding: 4px; min-width: 0; min-height: 0; overflow: hidden; }
+        /* xterm 必须 width+height 都 100%,否则 FitAddon 按内部默认尺寸测,cols/rows 都只够一半 */
+        .xterm { height: 100%; width: 100%; }
+        .xterm-viewport, .xterm-screen { width: 100% !important; height: 100% !important; }
+    </style>
+</head>
+<body>
+<div id="titlebar">
+    <div style="display:flex;align-items:center">
+        <div class="dots">
+            <a href="/" class="dot" style="background:#ef4444" title="Back to dashboard"></a>
+            <div class="dot" style="background:#eab308"></div>
+            <div class="dot" style="background:#22c55e"></div>
+        </div>
+        <span class="info" id="title-info"></span>
+    </div>
+    <span class="status" id="title-status">Connecting...</span>
+</div>
+<div id="terminal-container"></div>
+
+<script>
+(function() {
+    const params = new URLSearchParams(window.location.search);
+    const service = params.get('service');
+    const host = params.get('host');
+    const pid = params.get('pid');
+
+    document.getElementById('title-info').textContent = `${service} — ${host} (PID: ${pid})`;
+    document.title = `Terminal — ${service}@${host}`;
+
+    const term = new Terminal({
+        cursorBlink: true,
+        fontSize: 13,
+        fontFamily: "'JetBrains Mono', 'Menlo', 'Courier New', monospace",
+        theme: {
+            background: '#0a0a0a',
+            foreground: '#e0e0e0',
+            cursor: '#22c55e',
+            selectionBackground: '#334155',
+        },
+    });
+
+    const fitAddon = new FitAddon.FitAddon();
+    term.loadAddon(fitAddon);
+
+    const container = document.getElementById('terminal-container');
+    term.open(container);
+
+    // 必须在下一帧 fit:term.open 触发的 layout 还没完成,立即 fit 会拿到
+    // 错误宽度(通常是默认 80 列),导致"明明屏幕宽但一行就换行"的 bug
+    function safeFit() {
+        try { fitAddon.fit(); } catch (_) {}
+    }
+    requestAnimationFrame(safeFit);
+
+    // WebSocket connection
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${protocol}//${window.location.host}/ws/pty?service=${service}&host=${host}&pid=${pid}&cols=${term.cols}&rows=${term.rows}`;
+    const ws = new WebSocket(wsUrl);
+
+    const statusEl = document.getElementById('title-status');
+
+    ws.onopen = () => {
+        statusEl.textContent = 'Connected';
+        statusEl.style.color = '#22c55e';
+        // 连上后再 fit 一次并同步给 server:URL 参数 cols/rows 可能在 fit
+        // 完成前就被读取,server 侧 pty 会按"一半宽度"打开,造成文字早换行。
+        // 这里强制再发一次 resize,server 会调 pty 的 TIOCSWINSZ,对齐真实尺寸。
+        safeFit();
+        ws.send(JSON.stringify({type: 'resize', cols: term.cols, rows: term.rows}));
+    };
+
+    ws.onmessage = (e) => {
+        try {
+            const msg = JSON.parse(e.data);
+            if (msg.type === 'output') {
+                term.write(msg.data);
+            } else if (msg.type === 'close') {
+                term.write('\r\n\x1b[31m[Session closed]\x1b[0m\r\n');
+                statusEl.textContent = 'Disconnected';
+                statusEl.style.color = '#ef4444';
+            }
+        } catch (err) {
+            // ignore
+        }
+    };
+
+    ws.onclose = () => {
+        term.write('\r\n\x1b[31m[Connection closed]\x1b[0m\r\n');
+        statusEl.textContent = 'Disconnected';
+        statusEl.style.color = '#ef4444';
+    };
+
+    ws.onerror = () => {
+        statusEl.textContent = 'Error';
+        statusEl.style.color = '#ef4444';
+    };
+
+    // Send keyboard input
+    term.onData((data) => {
+        if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({type: 'input', data: data}));
+        }
+    });
+
+    // Handle resize
+    const sendResize = () => {
+        safeFit();
+        if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({type: 'resize', cols: term.cols, rows: term.rows}));
+        }
+    };
+
+    // 窗口大小变化
+    window.addEventListener('resize', sendResize);
+
+    // 容器大小变化(flex layout 稳定后触发,比 window resize 更准)。
+    // 修 "刚进页面排版错乱几秒后才正常"的问题
+    if (window.ResizeObserver) {
+        new ResizeObserver(sendResize).observe(container);
+    } else {
+        // 兜底:某些旧浏览器没 ResizeObserver
+        setTimeout(sendResize, 100);
+    }
+
+    // Focus terminal
+    term.focus();
+})();
+</script>
+</body>
+</html>

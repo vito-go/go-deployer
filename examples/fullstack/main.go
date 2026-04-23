@@ -36,8 +36,7 @@ func ipWhitelistHandler(w http.ResponseWriter, r *http.Request) (*http.Request, 
 }
 
 func main() {
-	// Full-stack configuration with both backend and frontend
-	cfg, err := deployer.NewConfig(deployer.ConfigParams{
+	dep, err := deployer.New(deployer.ConfigParams{
 		GithubRepo:     "git@github.com:yourorg/backend.git",
 		Env:            "production",
 		BuildEntry:     "./cmd/api",
@@ -49,12 +48,8 @@ func main() {
 	if err != nil {
 		log.Fatal("Config error:", err)
 	}
-
-	// Create deployer
-	dep := deployer.NewDeployer(cfg)
 	defer dep.Cleanup()
 
-	// Create router and mount routes with multiple PreHandlers (logging + IP whitelist)
 	mux := http.NewServeMux()
 	dep.Mount(mux, loggingHandler, ipWhitelistHandler)
 
@@ -70,8 +65,8 @@ func main() {
 	}()
 
 	log.Printf("🚀 Full-stack deployment console ready")
-	log.Printf("   Backend deployment: http://localhost:8080%s/backend/", cfg.BasePath)
-	log.Printf("   Frontend build:     http://localhost:8080%s/frontend/", cfg.BasePath)
+	log.Printf("   Backend deployment: http://localhost:8080/admin/deploy/backend/")
+	log.Printf("   Frontend build:     http://localhost:8080/admin/deploy/frontend/")
 	log.Printf("   Press Ctrl+C to stop")
 
 	if err := http.ListenAndServe(":8080", mux); err != nil {

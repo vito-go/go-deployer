@@ -2,11 +2,11 @@ package deployer
 
 import (
 	"bufio"
-	"context"
 	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html/template"
 	"net/http"
 	"os"
 	"os/exec"
@@ -14,10 +14,8 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
-	"syscall"
+	"sync"
 	"time"
-
-	"github.com/vito-go/mylog"
 )
 
 //go:embed index.html backend.html frontend.html
@@ -32,42 +30,45 @@ type PreHandler func(w http.ResponseWriter, r *http.Request) (newR *http.Request
 
 // ConfigParams contains parameters for creating a new Config
 type ConfigParams struct {
-	GithubRepo     string // Git repository URL (required)
+	ProjectName    string // Project name (optional, auto-derived from GithubRepo if empty)
+	GithubRepo     string // Git repository URL (optional, but at least one of GithubRepo or BinaryURL must be set)
 	Env            string // Environment name like "production", "staging" (required)
-	BuildEntry     string // Build entry point like "./cmd/app" or "." (required)
+	BuildEntry     string // Build entry point like "./cmd/app" or "." (required when GithubRepo is set)
 	AppArgs        string // Additional arguments to pass when starting the application (optional)
 	Port           uint   // Port of the deployed application (required, must support SO_REUSEPORT for zero-downtime)
 	BasePath       string // Base path for routes like "/deploy" or "/admin/deploy" (required)
+	BinaryURL      string // Pre-built binary download URL (optional, e.g. S3/CDN link). When set, enables URL-based deployment
 	FrontendGitURL string // Frontend repository Git URL (optional, empty = disabled)
 }
 
-// Config encapsulates global configuration for the deployer
-type Config struct {
-	ProjectName     string
-	BuildEntry      string    // e.g. cmd/cuti-api-go
-	GithubRepo      string    // Git repository URL (supports both HTTPS and SSH)
-	SourceDir       string    // Local directory for git repository clone
-	TargetBase      string    // Base directory for compiled binaries
-	WorkingDir      string    // Working directory for backend process
-	AppArgs         string    // Additional arguments to pass when starting the application
-	MetadataDir     string    // Instance metadata directory for JSON files
-	Port            uint      // Port of the deployed application (NOT the deployer itself) - used for process detection and instance management. Application must support SO_REUSEPORT for zero-downtime deployment.
-	BasePath        string    // Base path for all routes (e.g., "/deploy" or "/admin/deploy")
-	StartTime       time.Time // Server start time
-	FrontendGitURL  string    // Frontend repository Git URL
-	FrontendDir     string    // Local directory for frontend repository clone
-	FrontendDistDir string    // Frontend build output directory (worker/dist)
+// config encapsulates internal configuration for the deployer
+type config struct {
+	projectName     string
+	buildEntry      string
+	githubRepo      string
+	sourceDir       string
+	targetBase      string
+	workingDir      string
+	appArgs         string
+	metadataDir     string
+	port            uint
+	basePath        string
+	binaryURL       string
+	frontendGitURL  string
+	frontendDir     string
+	frontendDistDir string
 }
 
-// NewConfig creates a Config instance from the given parameters
-// It automatically derives project name from the repository URL and sets up directory paths
-func NewConfig(params ConfigParams) (*Config, error) {
-	// Validate required fields
-	if params.BuildEntry == "" {
-		return nil, errors.New("build entry cannot be empty")
+func newConfig(params ConfigParams) (*config, error) {
+	if params.GithubRepo == "" && params.BinaryURL == "" {
+		return nil, errors.New("at least one of GithubRepo or BinaryURL must be set")
 	}
-	if params.GithubRepo == "" {
-		return nil, errors.New("github repository URL cannot be empty")
+	if params.GithubRepo != "" && params.BuildEntry == "" {
+		return nil, errors.New("build entry cannot be empty when GithubRepo is set")
+	}
+	if params.GithubRepo == "" && params.BinaryURL != "" &&
+		(strings.Contains(params.BinaryURL, "{branch}") || strings.Contains(params.BinaryURL, "{commit}")) {
+		return nil, errors.New("GithubRepo is required when BinaryURL contains {branch} or {commit} placeholders")
 	}
 	if params.Env == "" {
 		return nil, errors.New("environment name cannot be empty")
@@ -79,108 +80,205 @@ func NewConfig(params ConfigParams) (*Config, error) {
 		return nil, errors.New("base path cannot be empty")
 	}
 
+	projectName := params.ProjectName
+	if projectName == "" && params.GithubRepo != "" {
+		ss := strings.Split(params.GithubRepo, "/")
+		if len(ss) == 0 {
+			return nil, fmt.Errorf("invalid repository URL: %s", params.GithubRepo)
+		}
+		projectName = strings.TrimSuffix(ss[len(ss)-1], ".git")
+	}
+	if projectName == "" {
+		return nil, errors.New("ProjectName is required when GithubRepo is not set")
+	}
+
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get user home directory: %w", err)
 	}
 
-	// Extract project name from repository URL
-	ss := strings.Split(params.GithubRepo, "/")
-	if len(ss) == 0 {
-		return nil, fmt.Errorf("invalid repository URL: %s", params.GithubRepo)
-	}
-	projectName := strings.TrimSuffix(ss[len(ss)-1], ".git")
-
-	// Normalize BasePath: ensure it starts with / and doesn't end with /
 	basePath := params.BasePath
 	if !strings.HasPrefix(basePath, "/") {
 		basePath = "/" + basePath
 	}
 	basePath = strings.TrimSuffix(basePath, "/")
 
-	// Create base directory
 	baseDir := filepath.Join(home, "."+projectName, params.Env)
 	if err := os.MkdirAll(baseDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create base directory %s: %w", baseDir, err)
 	}
 
-	return &Config{
-		ProjectName:     projectName,
-		BuildEntry:      params.BuildEntry,
-		GithubRepo:      params.GithubRepo,
-		SourceDir:       filepath.Join(baseDir, "repo"),
-		TargetBase:      filepath.Join(baseDir, "bin"),
-		WorkingDir:      filepath.Join(baseDir, "worker"),
-		MetadataDir:     filepath.Join(baseDir, "metadata"),
-		AppArgs:         params.AppArgs,
-		Port:            params.Port,
-		BasePath:        basePath,
-		StartTime:       time.Now(),
-		FrontendGitURL:  params.FrontendGitURL,
-		FrontendDir:     filepath.Join(baseDir, "frontend-repo"),
-		FrontendDistDir: filepath.Join(baseDir, "worker", "dist"),
+	return &config{
+		projectName:     projectName,
+		buildEntry:      params.BuildEntry,
+		githubRepo:      params.GithubRepo,
+		sourceDir:       filepath.Join(baseDir, "repo"),
+		targetBase:      filepath.Join(baseDir, "bin"),
+		workingDir:      filepath.Join(baseDir, "worker"),
+		metadataDir:     filepath.Join(baseDir, "metadata"),
+		appArgs:         params.AppArgs,
+		port:            params.Port,
+		basePath:        basePath,
+		binaryURL:       params.BinaryURL,
+		frontendGitURL:  params.FrontendGitURL,
+		frontendDir:     filepath.Join(baseDir, "frontend-repo"),
+		frontendDistDir: filepath.Join(baseDir, "worker", "dist"),
 	}, nil
 }
 
-// InstanceInfo represents runtime information about a deployed instance
-type InstanceInfo struct {
-	Pid        int    `json:"pid"`        // Process ID
-	Version    string `json:"version"`    // Git commit hash (short)
-	Uptime     string `json:"uptime"`     // Time elapsed since deployment
-	DeployedAt string `json:"deployedAt"` // Deployment timestamp
+type instanceInfo struct {
+	Pid        int    `json:"pid"`
+	Version    string `json:"version"`
+	Uptime     string `json:"uptime"`
+	DeployedAt string `json:"deployedAt"`
 }
 
 // Deployer manages application deployment and running instances
 type Deployer struct {
-	cfg             *Config
+	cfg             *config
+	startTime       time.Time
 	logChan         chan string
 	frontendLogChan chan string
+	deployMu        sync.Mutex
+	frontendMu      sync.Mutex
+
+	// Windows-only:tracked child 进程。Linux/Unix 下不用(SO_REUSEPORT 让新老
+	// 进程自行共存切换);Windows 无 SO_REUSEPORT,deployer 必须当 supervisor
+	// 显式 kill old → spawn new。
+	childMu  sync.Mutex
+	childPID int
 }
 
-// initRepo initializes the git repository by cloning if it doesn't exist
-func initRepo(cfg *Config) {
-	absSource, _ := filepath.Abs(cfg.SourceDir)
+func initRepo(cfg *config) {
+	absSource, _ := filepath.Abs(cfg.sourceDir)
 	if _, err := os.Stat(filepath.Join(absSource, ".git")); err != nil {
-		mylog.Printf("[INIT] Repo not found. Cloning: %s -> %s", cfg.GithubRepo, absSource)
-		out, err := exec.Command("git", "clone", cfg.GithubRepo, absSource).CombinedOutput()
+		out, err := exec.Command("git", "clone", cfg.githubRepo, absSource).CombinedOutput()
 		if err != nil {
-			mylog.Ctx(context.Background()).Warnf("[INIT] Clone failed: %v, output: %s", err, string(out))
+			_ = out
 		}
 	}
 }
-func mkdirAll(cfg *Config) {
-	// Create necessary directories
-	_ = os.MkdirAll(cfg.MetadataDir, 0755)
-	_ = os.MkdirAll(cfg.TargetBase, 0755)
-	_ = os.MkdirAll(cfg.WorkingDir, 0755)
-	_ = os.MkdirAll(cfg.SourceDir, 0755)
-	_ = os.MkdirAll(cfg.FrontendDir, 0755)
-	_ = os.MkdirAll(cfg.FrontendDistDir, 0755)
+
+func mkdirAll(cfg *config) {
+	_ = os.MkdirAll(cfg.metadataDir, 0755)
+	_ = os.MkdirAll(cfg.targetBase, 0755)
+	_ = os.MkdirAll(cfg.workingDir, 0755)
+	_ = os.MkdirAll(cfg.sourceDir, 0755)
+	_ = os.MkdirAll(cfg.frontendDir, 0755)
+	_ = os.MkdirAll(cfg.frontendDistDir, 0755)
 }
 
-// NewDeployer creates a new Deployer instance with the given config
-func NewDeployer(cfg *Config) *Deployer {
-	if cfg == nil {
-		panic("deployer config cannot be nil")
+// fetchGitBranches fetches and returns branch list from a git repo directory.
+func fetchGitBranches(repoDir string) ([]string, error) {
+	if err := exec.Command("git", "-C", repoDir, "fetch", "--all", "--prune").Run(); err != nil {
+		return nil, err
+	}
+	out, _ := exec.Command("git", "-C", repoDir, "branch", "-r").Output()
+
+	var branches []string
+	for _, line := range strings.Split(string(out), "\n") {
+		b := strings.TrimSpace(line)
+		ss := strings.SplitN(b, "/", 2)
+		if len(ss) != 2 {
+			continue
+		}
+		b = ss[1]
+		if strings.Contains(b, "->") || strings.HasPrefix(b, "HEAD") || b == "" {
+			continue
+		}
+		branches = append(branches, b)
 	}
 
-	// Create necessary directories
+	// Put main/master first
+	var result []string
+	for _, b := range branches {
+		if b == "main" || b == "master" {
+			result = append([]string{b}, result...)
+		} else {
+			result = append(result, b)
+		}
+	}
+	return result, nil
+}
+
+// fetchGitCommits returns recent commits for a branch from a git repo directory.
+func fetchGitCommits(repoDir, branch string) []map[string]string {
+	out, _ := exec.Command("git", "-C", repoDir, "log", "origin/"+branch, "-n", "10", "--pretty=format:%h|%an|%ar|%s").Output()
+	var commits []map[string]string
+	for _, line := range strings.Split(string(out), "\n") {
+		if p := strings.Split(line, "|"); len(p) >= 4 {
+			commits = append(commits, map[string]string{"hash": p[0], "author": p[1], "date": p[2], "msg": p[3]})
+		}
+	}
+	return commits
+}
+
+// streamLogs writes SSE events from a channel to the HTTP response.
+func streamLogs(w http.ResponseWriter, ch chan string) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	f, _ := w.(http.Flusher)
+	for msg := range ch {
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", msg)
+		f.Flush()
+		if strings.HasPrefix(msg, "EOF") || strings.HasPrefix(msg, "ERR") {
+			break
+		}
+	}
+}
+
+// startBinary 的平台分派:
+//   - Unix: nohup + SO_REUSEPORT 让新老进程共存几秒,零停机(starter_unix.go)
+//   - Windows: 无 SO_REUSEPORT,deployer 作 supervisor kill old → spawn new,
+//     约 3-5s downtime,集群 failover 兜底(starter_windows.go)
+//
+// platformStart 由各 platform 文件实现。chmod + cleanup 是共享前后置。
+func (s *Deployer) startBinary(targetPath string) {
+	s.logChan <- ">> STEP: Set Executable Permissions"
+	if err := os.Chmod(targetPath, 0755); err != nil {
+		s.logChan <- "ERR: Failed to set executable permissions: " + err.Error()
+		return
+	}
+	s.logChan <- "   SUCCESS"
+
+	if err := s.platformStart(targetPath); err != nil {
+		s.logChan <- "ERR: " + err.Error()
+		return
+	}
+
+	s.logChan <- ">> STEP: Cleanup Old Binaries"
+	s.cleanupOldBinaries(5)
+	s.logChan <- "   Keeping only the 5 most recent binaries"
+	s.logChan <- "EOF"
+}
+
+// New creates a new Deployer instance from the given parameters.
+func New(params ConfigParams) (*Deployer, error) {
+	cfg, err := newConfig(params)
+	if err != nil {
+		return nil, err
+	}
+
 	mkdirAll(cfg)
 
-	// Initialize source repository asynchronously
-	go initRepo(cfg)
-	go initFrontendRepo(cfg)
+	if cfg.githubRepo != "" {
+		go initRepo(cfg)
+	}
+	if cfg.frontendGitURL != "" {
+		go initFrontendRepo(cfg)
+	}
 
 	s := &Deployer{
 		cfg:             cfg,
+		startTime:       time.Now(),
 		logChan:         make(chan string, 100),
 		frontendLogChan: make(chan string, 100),
 	}
 
-	// Start heartbeat goroutine to maintain instance metadata
 	go s.heartbeatLoop()
 
-	return s
+	return s, nil
 }
 
 // heartbeatLoop periodically updates and saves instance metadata to disk
@@ -198,15 +296,14 @@ func (s *Deployer)heartbeatLoop() {
 			}
 		}
 	}
-	metaFile := filepath.Join(s.cfg.MetadataDir, fmt.Sprintf("%d.json", myPid))
+	metaFile := filepath.Join(s.cfg.metadataDir, fmt.Sprintf("%d.json", myPid))
 	for {
-		// Ensure metadata directory exists (in case it was deleted)
-		_ = os.MkdirAll(s.cfg.MetadataDir, 0755)
-		info := InstanceInfo{
+		_ = os.MkdirAll(s.cfg.metadataDir, 0755)
+		info := instanceInfo{
 			Pid:        myPid,
 			Version:    version,
-			Uptime:     time.Since(s.cfg.StartTime).Round(time.Second).String(),
-			DeployedAt: s.cfg.StartTime.Format(time.DateTime),
+			Uptime:     time.Since(s.startTime).Round(time.Second).String(),
+			DeployedAt: s.startTime.Format(time.DateTime),
 		}
 		data, _ := json.Marshal(info)
 		_ = os.WriteFile(metaFile, data, 0644)
@@ -220,18 +317,18 @@ func (s *Deployer)status(w http.ResponseWriter, r *http.Request) {
 	myPid := os.Getpid()
 
 	// Get all active PIDs listening on the configured port
-	out, _ := exec.Command("sh", "-c", fmt.Sprintf("lsof -t -i:%d -sTCP:LISTEN", s.cfg.Port)).Output()
+	out, _ := exec.Command("sh", "-c", fmt.Sprintf("lsof -t -i:%d -sTCP:LISTEN", s.cfg.port)).Output()
 	activePids := strings.Fields(string(out))
 	pidMap := make(map[string]bool)
 	for _, p := range activePids {
 		pidMap[p] = true
 	}
 
-	var instances []InstanceInfo
-	files, _ := os.ReadDir(s.cfg.MetadataDir)
+	var instances []instanceInfo
+	files, _ := os.ReadDir(s.cfg.metadataDir)
 
 	for _, f := range files {
-		path := filepath.Join(s.cfg.MetadataDir, f.Name())
+		path := filepath.Join(s.cfg.metadataDir, f.Name())
 		pidStr := strings.TrimSuffix(f.Name(), ".json")
 
 		// Skip non-PID files (e.g., frontend-build.json)
@@ -248,7 +345,7 @@ func (s *Deployer)status(w http.ResponseWriter, r *http.Request) {
 
 		// Read and parse metadata file
 		if data, err := os.ReadFile(path); err == nil {
-			var info InstanceInfo
+			var info instanceInfo
 			if err := json.Unmarshal(data, &info); err == nil {
 				instances = append(instances, info)
 			}
@@ -259,75 +356,32 @@ func (s *Deployer)status(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"instances":   instances,
 		"myPid":       myPid,
-		"repoUrl":     s.cfg.GithubRepo,
-		"projectName": s.cfg.ProjectName,
-		"port":        s.cfg.Port,
+		"repoUrl":     s.cfg.githubRepo,
+		"projectName": s.cfg.projectName,
+		"port":        s.cfg.port,
+		"binaryURL":   s.cfg.binaryURL,
 	})
 }
 
-// GitBranches returns the list of available Git branches from remote origin
-func (s *Deployer)gitBranches(w http.ResponseWriter, r *http.Request) {
-	_ = exec.Command("git", "-C", s.cfg.SourceDir, "fetch", "--all").Run()
-	//git fetch --all --prune
-	err := exec.Command("git", "-C", s.cfg.SourceDir, "fetch", "--all", "--prune").Run()
+func (s *Deployer) gitBranches(w http.ResponseWriter, r *http.Request) {
+	branches, err := fetchGitBranches(s.cfg.sourceDir)
 	if err != nil {
-		mylog.Printf("[GIT] Fetch prune failed: %v", err)
 		http.Error(w, "Git fetch failed", http.StatusInternalServerError)
-		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	//out, _ := exec.Command("git", "-C", s.cfg.SourceDir, "for-each-ref", "--format=%(refname:lstrip=3)", "refs/remotes/origin/").Output()
-	out, _ := exec.Command("git", "-C", s.cfg.SourceDir, "branch", "-r").Output()
-	branches := []string{}
-
-	for _, line := range strings.Split(string(out), "\n") {
-		b := strings.TrimSpace(line)
-		ss := strings.SplitN(b, "/", 2)
-		if len(ss) != 2 {
-			continue
-		}
-		b = ss[1]
-		if strings.Contains(b, "->") {
-			continue
-		}
-		if strings.HasPrefix(b, "HEAD") {
-			continue
-		}
-		if b != "" && b != "HEAD" {
-			branches = append(branches, b)
-		}
-	}
-	// 把main或 master 放到最前面
-	var branchNames []string
-	for _, b := range branches {
-		if b == "main" || b == "master" {
-			branchNames = append([]string{b}, branchNames...)
-		} else {
-			branchNames = append(branchNames, b)
-		}
-	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(branchNames)
+	_ = json.NewEncoder(w).Encode(branches)
 }
 
-// GitCommits returns the recent commit history for a specific branch
-func (s *Deployer)gitCommits(w http.ResponseWriter, r *http.Request) {
-	branch := r.URL.Query().Get("branch")
-	out, _ := exec.Command("git", "-C", s.cfg.SourceDir, "log", "origin/"+branch, "-n", "10", "--pretty=format:%h|%an|%ar|%s").Output()
-	var commits []map[string]string
-	for _, line := range strings.Split(string(out), "\n") {
-		if p := strings.Split(line, "|"); len(p) >= 4 {
-			commits = append(commits, map[string]string{"hash": p[0], "author": p[1], "date": p[2], "msg": p[3]})
-		}
-	}
+func (s *Deployer) gitCommits(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(commits)
+	_ = json.NewEncoder(w).Encode(fetchGitCommits(s.cfg.sourceDir, r.URL.Query().Get("branch")))
 }
 
 // cleanupOldBinaries removes old binary files, keeping only the most recent N versions
 // This prevents disk space waste from accumulating historical binaries
 func (s *Deployer)cleanupOldBinaries(keepCount int) {
-	files, err := os.ReadDir(s.cfg.TargetBase)
+	files, err := os.ReadDir(s.cfg.targetBase)
 	if err != nil {
 		return
 	}
@@ -344,7 +398,7 @@ func (s *Deployer)cleanupOldBinaries(keepCount int) {
 			continue
 		}
 		// Only consider files that match the project name pattern
-		if strings.HasPrefix(f.Name(), s.cfg.ProjectName+"-") {
+		if strings.HasPrefix(f.Name(), s.cfg.projectName+"-") {
 			info, err := f.Info()
 			if err != nil {
 				continue
@@ -372,23 +426,91 @@ func (s *Deployer)cleanupOldBinaries(keepCount int) {
 
 	// Remove old binaries (keep only the most recent N)
 	for i := keepCount; i < len(binaries); i++ {
-		oldPath := filepath.Join(s.cfg.TargetBase, binaries[i].name)
+		oldPath := filepath.Join(s.cfg.targetBase, binaries[i].name)
 		_ = os.Remove(oldPath)
-		mylog.Printf("[CLEANUP] Removed old binary: %s", binaries[i].name)
+		_ = binaries[i].name
 	}
+}
+
+// deployFromURL starts a new deployment by downloading a pre-built binary from the configured BinaryURL
+// Supports any HTTP/HTTPS URL including S3 pre-signed URLs
+func (s *Deployer) deployFromURL(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.binaryURL == "" {
+		http.Error(w, "BinaryURL not configured", http.StatusNotFound)
+		return
+	}
+	if !s.deployMu.TryLock() {
+		http.Error(w, "A deployment is already in progress", http.StatusConflict)
+		return
+	}
+
+	downloadURL := s.cfg.binaryURL
+	branch := r.URL.Query().Get("branch")
+	commit := r.URL.Query().Get("commit")
+	downloadURL = strings.ReplaceAll(downloadURL, "{branch}", branch)
+	downloadURL = strings.ReplaceAll(downloadURL, "{commit}", commit)
+
+	// Use commit in binName if available, otherwise use timestamp
+	var binName string
+	if commit != "" {
+		binName = fmt.Sprintf("%s-url-%s", s.cfg.projectName, commit)
+	} else {
+		binName = fmt.Sprintf("%s-url-%d", s.cfg.projectName, time.Now().UnixMilli())
+	}
+	targetPath, _ := filepath.Abs(filepath.Join(s.cfg.targetBase, binName))
+	mkdirAll(s.cfg)
+
+	go func() {
+		defer s.deployMu.Unlock()
+		s.logChan <- fmt.Sprintf("[Go-Cluster] %s Ready to deploy from URL...", time.Now().Format(time.DateTime))
+
+		start := time.Now()
+		s.logChan <- ">> STEP: Download Binary"
+		s.logChan <- "   URL: " + downloadURL
+		s.logChan <- "   Target: " + targetPath
+		cmd := exec.Command("curl", "-fSL", "--progress-bar", "-o", targetPath, downloadURL)
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			s.logChan <- "ERR:" + err.Error()
+			return
+		}
+		cmd.Stderr = cmd.Stdout
+		if err := cmd.Start(); err != nil {
+			s.logChan <- "ERR:" + err.Error()
+			return
+		}
+		sc := bufio.NewScanner(stdout)
+		for sc.Scan() {
+			s.logChan <- "   " + sc.Text()
+		}
+		if err := cmd.Wait(); err != nil {
+			s.logChan <- "ERR: Download failed: " + err.Error()
+			return
+		}
+		s.logChan <- fmt.Sprintf("   SUCCESS (%v)", time.Since(start).Round(time.Millisecond))
+
+		s.startBinary(targetPath)
+	}()
+	_, _ = w.Write([]byte("OK"))
 }
 
 // Deploy starts a new deployment for the specified branch and commit
 // The deployment runs asynchronously and streams logs to the logChan
-func (s *Deployer)deploy(w http.ResponseWriter, r *http.Request) {
+func (s *Deployer) deploy(w http.ResponseWriter, r *http.Request) {
+	if !s.deployMu.TryLock() {
+		http.Error(w, "A deployment is already in progress", http.StatusConflict)
+		return
+	}
+
 	branch, commit := r.URL.Query().Get("branch"), r.URL.Query().Get("commit")
-	binName := fmt.Sprintf("%s-%s", s.cfg.ProjectName, commit)
-	targetPath, _ := filepath.Abs(filepath.Join(s.cfg.TargetBase, binName))
+	binName := fmt.Sprintf("%s-%s", s.cfg.projectName, commit)
+	targetPath, _ := filepath.Abs(filepath.Join(s.cfg.targetBase, binName))
 	mkdirAll(s.cfg)
 
 	go func() {
-		// Determine build entry: use "." if empty, otherwise use the specified path
-		fInfo, err := os.Stat(filepath.Join(s.cfg.SourceDir, s.cfg.BuildEntry))
+		defer s.deployMu.Unlock()
+
+		fInfo, err := os.Stat(filepath.Join(s.cfg.sourceDir, s.cfg.buildEntry))
 		if err != nil {
 			s.logChan <- "ERR: Build entry path error: " + err.Error()
 			return
@@ -396,16 +518,16 @@ func (s *Deployer)deploy(w http.ResponseWriter, r *http.Request) {
 
 		var buildWorkingDir string
 		if fInfo.IsDir() {
-			buildWorkingDir = filepath.Join(s.cfg.SourceDir, s.cfg.BuildEntry)
+			buildWorkingDir = filepath.Join(s.cfg.sourceDir, s.cfg.buildEntry)
 		} else {
-			buildWorkingDir = filepath.Dir(filepath.Join(s.cfg.SourceDir, s.cfg.BuildEntry))
+			buildWorkingDir = filepath.Dir(filepath.Join(s.cfg.sourceDir, s.cfg.buildEntry))
 		}
 
 		steps := []struct{ n, c, desc, workingDir string }{
 			{n: "Sync Source",
-				c: fmt.Sprintf("git fetch --all && git checkout -f %s && git reset --hard %s", branch, commit), desc: s.cfg.GithubRepo,
-
-				workingDir: s.cfg.SourceDir,
+				c:          fmt.Sprintf("git fetch --all && git checkout -f %s && git reset --hard %s", branch, commit),
+				desc:       s.cfg.githubRepo,
+				workingDir: s.cfg.sourceDir,
 			},
 			{n: "Build Binary",
 				c:          fmt.Sprintf(`go build -ldflags "-s -w" -trimpath -o %s ./`, targetPath),
@@ -428,8 +550,7 @@ func (s *Deployer)deploy(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			cmd.Stderr = cmd.Stdout
-			err = cmd.Start()
-			if err != nil {
+			if err := cmd.Start(); err != nil {
 				s.logChan <- "ERR:" + err.Error()
 				return
 			}
@@ -444,91 +565,63 @@ func (s *Deployer)deploy(w http.ResponseWriter, r *http.Request) {
 			s.logChan <- fmt.Sprintf("   SUCCESS (%v)", time.Since(start).Round(time.Millisecond))
 		}
 
-		// Ensure the binary has executable permissions
-		s.logChan <- ">> STEP: Set Executable Permissions"
-		if err := os.Chmod(targetPath, 0755); err != nil {
-			s.logChan <- "ERR: Failed to set executable permissions: " + err.Error()
-			return
-		}
-		s.logChan <- "   SUCCESS"
-
-		fullCmd := fmt.Sprintf("nohup %s %s > /dev/null 2>&1 &", targetPath, s.cfg.AppArgs)
-		newCmd := exec.Command("sh", "-c", fullCmd)
-		newCmd.Dir = s.cfg.WorkingDir
-		newCmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-		s.logChan <- ">> RUN: " + fullCmd
-		if err := newCmd.Start(); err != nil {
-			s.logChan <- "ERR: " + err.Error()
-		} else {
-			_ = newCmd.Wait()
-
-			// Clean up old binaries (keep only the last 5 versions)
-			s.logChan <- ">> STEP: Cleanup Old Binaries"
-			s.cleanupOldBinaries(5)
-			s.logChan <- "   Keeping only the 5 most recent binaries"
-
-			s.logChan <- "EOF"
-		}
+		s.startBinary(targetPath)
 	}()
 	_, _ = w.Write([]byte("OK"))
 }
 
-// DeployLogs streams deployment logs to the client via Server-Sent Events (SSE)
-func (s *Deployer)deployLogs(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	f, _ := w.(http.Flusher)
-	for msg := range s.logChan {
-		mylog.Info(msg)
-		_, _ = fmt.Fprintf(w, "data: %s\n\n", msg)
-		f.Flush()
-		if strings.HasPrefix(msg, "EOF") || strings.HasPrefix(msg, "ERR") {
-			break
-		}
-	}
+func (s *Deployer) deployLogs(w http.ResponseWriter, r *http.Request) {
+	streamLogs(w, s.logChan)
 }
 
 // Kill terminates a specified instance by PID
 // Prevents killing the last running instance to maintain service availability
-func (s *Deployer)kill(w http.ResponseWriter, r *http.Request) {
+func (s *Deployer) kill(w http.ResponseWriter, r *http.Request) {
 	pid, _ := strconv.Atoi(r.URL.Query().Get("pid"))
-	out, _ := exec.Command("sh", "-c", fmt.Sprintf("lsof -t -i:%d -sTCP:LISTEN", s.cfg.Port)).Output()
-	if len(strings.Fields(string(out))) <= 1 {
+	// Unix 下端口上通常有多个 listener(SO_REUSEPORT);Windows 只有 1 个。
+	// 保留"last instance standing"保护:不让用户把唯一的实例 kill 掉。
+	if countPortListeners(s.cfg.port) <= 1 {
 		w.WriteHeader(http.StatusForbidden)
 		_, _ = w.Write([]byte("Action Denied: Last instance standing."))
 		return
 	}
 
 	// Permission check: only allow killing PIDs managed by this cluster
-	infoPath := filepath.Join(s.cfg.MetadataDir, fmt.Sprintf("%d.json", pid))
+	infoPath := filepath.Join(s.cfg.metadataDir, fmt.Sprintf("%d.json", pid))
 	if _, err := os.Stat(infoPath); os.IsNotExist(err) {
 		http.Error(w, "Permission Denied: PID not managed by cluster.", http.StatusForbidden)
 		return
 	}
-	mylog.Printf("[SECURITY] Kill request for PID %d accepted from %s", pid, r.RemoteAddr)
-	_ = os.Remove(filepath.Join(s.cfg.MetadataDir, fmt.Sprintf("%d.json", pid)))
+	_ = os.Remove(filepath.Join(s.cfg.metadataDir, fmt.Sprintf("%d.json", pid)))
 	_, _ = w.Write([]byte("OK"))
 	go func() {
 		time.Sleep(500 * time.Millisecond)
-		_ = syscall.Kill(pid, syscall.SIGTERM)
+		_ = killManagedPID(pid)
 	}()
 }
 
-// IndexPage serves the navigation homepage
-func (s *Deployer)indexPage(w http.ResponseWriter, r *http.Request) {
+func (s *Deployer) indexPage(w http.ResponseWriter, r *http.Request) {
 	data, err := embedFS.ReadFile("index.html")
 	if err != nil {
 		http.Error(w, "Page not found", http.StatusNotFound)
 		return
 	}
+	tmpl, err := template.New("index").Parse(string(data))
+	if err != nil {
+		http.Error(w, "Template error", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = w.Write(data)
+	_ = tmpl.Execute(w, map[string]bool{
+		"ShowFrontend": s.cfg.frontendGitURL != "",
+	})
 }
 
 // HomeBackend serves the backend deployment dashboard HTML page
 func (s *Deployer)homeBackend(w http.ResponseWriter, r *http.Request) {
-	initRepo(s.cfg)
+	if s.cfg.githubRepo != "" {
+		initRepo(s.cfg)
+	}
 	data, err := embedFS.ReadFile("backend.html")
 	if err != nil {
 		http.Error(w, "Page not found", http.StatusNotFound)
@@ -540,7 +633,7 @@ func (s *Deployer)homeBackend(w http.ResponseWriter, r *http.Request) {
 
 // HomeFrontend serves the frontend build dashboard HTML page
 func (s *Deployer)homeFrontend(w http.ResponseWriter, r *http.Request) {
-	if s.cfg.FrontendGitURL == "" {
+	if s.cfg.frontendGitURL == "" {
 		http.Error(w, "Frontend repository not configured", http.StatusNotFound)
 		return
 	}
@@ -557,21 +650,21 @@ func (s *Deployer)homeFrontend(w http.ResponseWriter, r *http.Request) {
 // Cleanup removes the instance metadata file for this process
 func (s *Deployer)Cleanup() {
 	myPid := os.Getpid()
-	_ = os.Remove(filepath.Join(s.cfg.MetadataDir, fmt.Sprintf("%d.json", myPid)))
+	_ = os.Remove(filepath.Join(s.cfg.metadataDir, fmt.Sprintf("%d.json", myPid)))
 }
 
 // Mount registers all deployer routes to the given router with optional pre-handlers
 // router: HTTP router that implements Router interface (e.g., http.ServeMux, chi.Router, gin.Engine)
 // preHandlers: middleware functions executed before each route handler (auth, logging, etc.)
 func (s *Deployer)Mount(router Router, preHandlers ...PreHandler) {
-	base := s.cfg.BasePath
+	base := s.cfg.basePath
 
 	// Register navigation homepage
 	handleFunc(router, fmt.Sprintf("GET %s/", base), s.indexPage, preHandlers...)
 
 	// Mount backend and frontend routes
 	s.mountBackend(router, base, preHandlers...)
-	if s.cfg.FrontendGitURL != "" {
+	if s.cfg.frontendGitURL != "" {
 		s.mountFrontend(router, base, preHandlers...)
 	}
 }
@@ -580,11 +673,16 @@ func (s *Deployer)Mount(router Router, preHandlers ...PreHandler) {
 func (s *Deployer)mountBackend(router Router, base string, preHandlers ...PreHandler) {
 	handleFunc(router, fmt.Sprintf("GET %s/backend/", base), s.homeBackend, preHandlers...)
 	handleFunc(router, fmt.Sprintf("GET %s/backend/status", base), s.status, preHandlers...)
-	handleFunc(router, fmt.Sprintf("GET %s/backend/git/branches", base), s.gitBranches, preHandlers...)
-	handleFunc(router, fmt.Sprintf("GET %s/backend/git/commits", base), s.gitCommits, preHandlers...)
-	handleFunc(router, fmt.Sprintf("POST %s/backend/deploy", base), s.deploy, preHandlers...)
 	handleFunc(router, fmt.Sprintf("GET %s/backend/deploy/logs", base), s.deployLogs, preHandlers...)
 	handleFunc(router, fmt.Sprintf("POST %s/backend/kill", base), s.kill, preHandlers...)
+	if s.cfg.githubRepo != "" {
+		handleFunc(router, fmt.Sprintf("GET %s/backend/git/branches", base), s.gitBranches, preHandlers...)
+		handleFunc(router, fmt.Sprintf("GET %s/backend/git/commits", base), s.gitCommits, preHandlers...)
+		handleFunc(router, fmt.Sprintf("POST %s/backend/deploy", base), s.deploy, preHandlers...)
+	}
+	if s.cfg.binaryURL != "" {
+		handleFunc(router, fmt.Sprintf("POST %s/backend/deploy-url", base), s.deployFromURL, preHandlers...)
+	}
 }
 
 // mountFrontend registers frontend build routes

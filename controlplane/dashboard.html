@@ -1,0 +1,990 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Deployer Control Plane</title>
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono&display=swap" rel="stylesheet">
+    <script>tailwind.config = {darkMode: 'class'}</script>
+    <style>
+        .mono { font-family: 'JetBrains Mono', monospace; }
+        .custom-scrollbar::-webkit-scrollbar { width: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
+        .dark .custom-scrollbar::-webkit-scrollbar-thumb { background: #334155; }
+        @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+        .animate-spin { animation: spin 1s linear infinite; }
+        .terminal { background-color: #0a0e14; }
+        .terminal-scrollbar::-webkit-scrollbar { width: 8px; height: 8px; }
+        .terminal-scrollbar::-webkit-scrollbar-track { background: #0a0e14; }
+        .terminal-scrollbar::-webkit-scrollbar-thumb { background: #1f2937; border-radius: 4px; }
+        .terminal-scrollbar::-webkit-scrollbar-thumb:hover { background: #334155; }
+        @keyframes pulse-dot { 0%,100% { opacity: 1; } 50% { opacity: .4; } }
+        .pulse-dot { animation: pulse-dot 1.2s ease-in-out infinite; }
+        .task-panel-shadow { box-shadow: 0 -8px 32px -8px rgba(0,0,0,0.25); }
+    </style>
+</head>
+<body class="transition-colors duration-500 bg-gray-50 dark:bg-slate-900 text-gray-900 dark:text-slate-100 min-h-screen">
+<div id="root"></div>
+<script type="text/babel">
+const {useState, useEffect, useRef} = React;
+
+// ANSI-like color tagging based on line content
+const classifyLine = (line) => {
+    if (line.startsWith(">> COMPLETED")) return 'text-green-400 font-bold';
+    if (line.startsWith(">> FAILED") || line.startsWith(">> CONNECTION LOST")) return 'text-red-400 font-bold';
+    if (line.startsWith("!!")) return 'text-red-400';
+    if (line.startsWith("[SYSTEM]")) return 'text-cyan-400';
+    if (/\berror\b|\bfailed\b|\bfail\b/i.test(line)) return 'text-red-300';
+    if (/\bwarn\b|\bwarning\b/i.test(line)) return 'text-yellow-300';
+    if (/\bok\b|\bdone\b|\bsuccess\b/i.test(line)) return 'text-green-300';
+    return 'text-slate-200';
+};
+
+const fmtDuration = (ms) => {
+    if (ms < 1000) return ms + 'ms';
+    const s = Math.floor(ms / 1000);
+    if (s < 60) return s + 's';
+    return Math.floor(s / 60) + 'm ' + (s % 60) + 's';
+};
+
+const fmtTime = (ts) => new Date(ts).toLocaleTimeString();
+
+function StatusIcon({status}) {
+    if (status === 'running') {
+        return <span className="inline-block w-2 h-2 rounded-full bg-blue-400 pulse-dot" title="running"></span>;
+    }
+    if (status === 'success') {
+        return <span className="inline-block w-2 h-2 rounded-full bg-green-500" title="success"></span>;
+    }
+    return <span className="inline-block w-2 h-2 rounded-full bg-red-500" title="failed"></span>;
+}
+
+function TaskPanel({tasks, activeTaskId, setActiveTaskId, closeTask, clearFinishedTasks, minimized, setMinimized, runningCount, logBodyRef}) {
+    const [copied, setCopied] = useState(false);
+    if (tasks.length === 0) return null;
+    const activeTask = tasks.find(t => t.id === activeTaskId) || tasks[tasks.length - 1];
+    const duration = activeTask.endedAt
+        ? fmtDuration(activeTask.endedAt - activeTask.startedAt)
+        : fmtDuration(Date.now() - activeTask.startedAt);
+
+    const copyLogs = async () => {
+        try {
+            await navigator.clipboard.writeText(activeTask.logs.join('\n'));
+            setCopied(true);
+            setTimeout(() => setCopied(false), 1200);
+        } catch {}
+    };
+
+    // Minimized: compact pill at bottom-right
+    if (minimized) {
+        return (
+            <div className="fixed bottom-4 right-4 z-40">
+                <button onClick={() => setMinimized(false)}
+                    className="flex items-center gap-2 px-3 py-2 rounded-xl bg-slate-800 text-slate-200 shadow-2xl border border-slate-700 hover:bg-slate-700 transition-all">
+                    <span className="relative flex h-2 w-2">
+                        {runningCount > 0 && <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75"></span>}
+                        <span className={`relative inline-flex rounded-full h-2 w-2 ${runningCount > 0 ? 'bg-blue-500' : 'bg-slate-500'}`}></span>
+                    </span>
+                    <span className="mono text-[11px] font-bold">
+                        {runningCount > 0 ? `${runningCount} running` : `${tasks.length} task(s)`}
+                    </span>
+                    <svg className="w-3.5 h-3.5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 15l7-7 7 7"/></svg>
+                </button>
+            </div>
+        );
+    }
+
+    return (
+        <div className="fixed bottom-0 left-72 right-0 z-30 task-panel-shadow">
+            <div className="bg-slate-900 border-t border-slate-700 flex flex-col" style={{height: '340px'}}>
+                {/* Tab bar */}
+                <div className="flex items-center bg-slate-800/80 border-b border-slate-700 pr-2">
+                    <div className="flex-1 flex items-center overflow-x-auto custom-scrollbar">
+                        {tasks.map(t => {
+                            const isActive = t.id === activeTask.id;
+                            return (
+                                <div key={t.id}
+                                    onClick={() => setActiveTaskId(t.id)}
+                                    className={`group flex items-center gap-2 px-3 py-2 cursor-pointer border-r border-slate-700 transition-colors flex-shrink-0 max-w-[260px]
+                                        ${isActive ? 'bg-slate-900 text-slate-100' : 'text-slate-400 hover:text-slate-200 hover:bg-slate-700/40'}`}>
+                                    <StatusIcon status={t.status}/>
+                                    <span className="mono text-[11px] truncate" title={t.title}>{t.title}</span>
+                                    <button
+                                        onClick={(e) => { e.stopPropagation(); closeTask(t.id); }}
+                                        className="text-slate-500 hover:text-red-400 opacity-60 group-hover:opacity-100 transition-opacity text-sm leading-none">&times;</button>
+                                </div>
+                            );
+                        })}
+                    </div>
+                    <div className="flex items-center gap-1 pl-2 flex-shrink-0">
+                        <button onClick={copyLogs} title="Copy logs"
+                            className="p-1.5 rounded text-slate-400 hover:text-slate-100 hover:bg-slate-700 transition-all">
+                            {copied
+                                ? <svg className="w-3.5 h-3.5 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M5 13l4 4L19 7"/></svg>
+                                : <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
+                            }
+                        </button>
+                        <button onClick={clearFinishedTasks} title="Clear finished"
+                            className="p-1.5 rounded text-slate-400 hover:text-slate-100 hover:bg-slate-700 transition-all">
+                            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6M1 7h22M9 7V4a1 1 0 011-1h4a1 1 0 011 1v3"/></svg>
+                        </button>
+                        <button onClick={() => setMinimized(true)} title="Minimize"
+                            className="p-1.5 rounded text-slate-400 hover:text-slate-100 hover:bg-slate-700 transition-all">
+                            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7"/></svg>
+                        </button>
+                    </div>
+                </div>
+
+                {/* Meta bar */}
+                <div className="flex items-center justify-between px-4 py-1.5 bg-slate-900 border-b border-slate-800 text-[10px] mono text-slate-400">
+                    <div className="flex items-center gap-3">
+                        <span className="uppercase tracking-wider opacity-60">Type</span>
+                        <span className="text-slate-200 uppercase">{activeTask.type || '-'}</span>
+                        <span className="text-slate-700">|</span>
+                        <span className="uppercase tracking-wider opacity-60">Target</span>
+                        <span className="text-slate-200">{activeTask.target || '-'}</span>
+                        <span className="text-slate-700">|</span>
+                        <span className="uppercase tracking-wider opacity-60">Req</span>
+                        <span className="text-slate-500 truncate max-w-[200px]" title={activeTask.id}>{activeTask.id}</span>
+                    </div>
+                    <div className="flex items-center gap-3">
+                        <span>Started {fmtTime(activeTask.startedAt)}</span>
+                        <span className="text-slate-700">|</span>
+                        <span className={activeTask.status === 'running' ? 'text-blue-400' : activeTask.status === 'success' ? 'text-green-400' : 'text-red-400'}>
+                            {activeTask.status === 'running' ? `Running ${duration}` : `${activeTask.status === 'success' ? 'Done' : 'Failed'} in ${duration}`}
+                        </span>
+                    </div>
+                </div>
+
+                {/* Log body */}
+                <div ref={logBodyRef} className="flex-1 overflow-y-auto terminal-scrollbar terminal px-4 py-3 mono text-[11.5px] leading-relaxed whitespace-pre-wrap break-all">
+                    {activeTask.logs.map((l, i) => (
+                        <div key={i} className={classifyLine(l)}>
+                            <span className="text-slate-600 select-none mr-2">{String(i + 1).padStart(3, ' ')}</span>
+                            <span>{l}</span>
+                        </div>
+                    ))}
+                </div>
+            </div>
+        </div>
+    );
+}
+
+function App() {
+    // --- Theme ---
+    const [darkMode, setDarkMode] = useState(() => {
+        const saved = localStorage.getItem('theme');
+        return saved ? saved === 'dark' : true;
+    });
+    useEffect(() => {
+        document.documentElement.classList.toggle('dark', darkMode);
+        localStorage.setItem('theme', darkMode ? 'dark' : 'light');
+    }, [darkMode]);
+    const [isAdmin, setIsAdmin] = useState(false);
+    const [services, setServices] = useState([]);
+    const [searchQuery, setSearchQuery] = useState('');
+    const [collapsedGroups, setCollapsedGroups] = useState(new Set());
+    const [selected, setSelected] = useState(null);
+    const [batchSelected, setBatchSelected] = useState(new Set()); // for batch deploy
+    const [detail, setDetail] = useState(null);
+    const [files, setFiles] = useState([]);
+    const [toast, setToast] = useState('');
+    const showToast = (msg) => { setToast(msg); setTimeout(() => setToast(''), 2000); };
+    const [selectedFile, setSelectedFile] = useState(null); // {name, hash}
+    const [appArgs, setAppArgs] = useState('');
+    const [argsHistory, setArgsHistory] = useState([]);
+
+    const loadArgsHistory = (svc) => {
+        try {
+            const h = JSON.parse(localStorage.getItem(`appArgs:${svc}`) || '[]');
+            setArgsHistory(h);
+        } catch { setArgsHistory([]); }
+    };
+    const saveArgsHistory = (svc, args) => {
+        if (!args || !svc) return;
+        try {
+            let h = JSON.parse(localStorage.getItem(`appArgs:${svc}`) || '[]');
+            h = [args, ...h.filter(a => a !== args)].slice(0, 10);
+            localStorage.setItem(`appArgs:${svc}`, JSON.stringify(h));
+            setArgsHistory(h);
+        } catch {}
+    };
+    const removeArgsHistory = (svc, args) => {
+        try {
+            let h = JSON.parse(localStorage.getItem(`appArgs:${svc}`) || '[]');
+            h = h.filter(a => a !== args);
+            localStorage.setItem(`appArgs:${svc}`, JSON.stringify(h));
+            setArgsHistory(h);
+        } catch {}
+    };
+    const [modalInst, setModalInst] = useState(null);
+    const [resources, setResources] = useState([]); // real-time resource data
+    // Multi-task model: each deploy/restart/kill/rollback creates an independent task
+    // task: {id, title, type, target, logs:[], status:'running'|'success'|'failed', startedAt, endedAt}
+    const [tasks, setTasks] = useState([]);
+    const [activeTaskId, setActiveTaskId] = useState(null);
+    const [panelMinimized, setPanelMinimized] = useState(false);
+    const [selectedInsts, setSelectedInsts] = useState(new Set()); // "host|pid"
+    const logBodyRef = useRef(null);
+    const eventSourcesRef = useRef({}); // requestId -> EventSource
+
+    const activeTask = tasks.find(t => t.id === activeTaskId) || null;
+    const runningCount = tasks.filter(t => t.status === 'running').length;
+
+    useEffect(() => {
+        const el = logBodyRef.current;
+        if (!el) return;
+        const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+        if (nearBottom) el.scrollTop = el.scrollHeight;
+    }, [activeTask?.logs?.length, activeTaskId]);
+
+    // Reset per-instance selection when switching services
+    useEffect(() => { setSelectedInsts(new Set()); }, [selected]);
+
+    // Poll services
+    const fetchServices = async () => {
+        try {
+            const res = await fetch('/api/services');
+            const data = await res.json();
+            setServices(data || []);
+        } catch (e) { console.error("Fetch services failed"); }
+    };
+
+    useEffect(() => {
+        fetch('/api/role').then(r => r.json()).then(d => setIsAdmin(d.role === 'admin')).catch(() => {});
+        fetchServices();
+        const t = setInterval(fetchServices, 1000);
+        return () => clearInterval(t);
+    }, []);
+
+    // When selected service changes, load detail + subscribe to resources SSE
+    useEffect(() => {
+        if (!selected) { setDetail(null); setResources([]); return; }
+        const load = async () => {
+            try {
+                const res = await fetch(`/api/services/${selected}`);
+                const data = await res.json();
+                setDetail(data);
+            } catch (e) { console.error("Fetch detail failed"); }
+        };
+        load();
+        const t = setInterval(load, 1000);
+
+        // SSE for real-time resource monitoring
+        const es = new EventSource(`/api/services/${selected}/resources`);
+        es.onmessage = (e) => {
+            try {
+                const data = JSON.parse(e.data);
+                setResources(data.instances || []);
+            } catch (err) {}
+        };
+
+        return () => { clearInterval(t); es.close(); };
+    }, [selected]);
+
+    const loadFiles = async (svc) => {
+        try {
+            const res = await fetch(`/api/services/${svc}/files`);
+            const data = await res.json();
+            setFiles(data || []);
+            if (data?.length > 0) setSelectedFile(data[0]);
+        } catch (e) { console.error("Fetch files failed"); }
+    };
+
+    const selectService = (name) => {
+        setSelected(name);
+        setFiles([]);
+        setSelectedFile(null);
+        setAppArgs('');
+        loadFiles(name);
+        loadArgsHistory(name);
+    };
+
+    const startLogStream = (requestId, title, type, target) => {
+        setTasks(prev => [
+            ...prev,
+            {
+                id: requestId,
+                title,
+                type,
+                target: target || '',
+                logs: ["[SYSTEM] Waiting for agent response..."],
+                status: 'running',
+                startedAt: Date.now(),
+                endedAt: 0,
+                service: selected,
+            }
+        ]);
+        setActiveTaskId(requestId);
+        setPanelMinimized(false);
+
+        const es = new EventSource(`/api/services/${selected}/logs?requestId=${requestId}`);
+        eventSourcesRef.current[requestId] = es;
+        es.onmessage = (e) => {
+            if (e.data.startsWith("EOF") || e.data.startsWith("ERR")) {
+                const success = e.data === "EOF";
+                setTasks(prev => prev.map(t => t.id === requestId
+                    ? {
+                        ...t,
+                        logs: [...t.logs, success ? ">> COMPLETED SUCCESSFULLY" : ">> FAILED: " + e.data],
+                        status: success ? 'success' : 'failed',
+                        endedAt: Date.now(),
+                    }
+                    : t));
+                es.close();
+                delete eventSourcesRef.current[requestId];
+                return;
+            }
+            setTasks(prev => prev.map(t => t.id === requestId
+                ? { ...t, logs: [...t.logs, e.data] }
+                : t));
+        };
+        es.onerror = () => {
+            es.close();
+            delete eventSourcesRef.current[requestId];
+            setTasks(prev => prev.map(t => (t.id === requestId && t.status === 'running')
+                ? { ...t, logs: [...t.logs, ">> CONNECTION LOST"], status: 'failed', endedAt: Date.now() }
+                : t));
+        };
+    };
+
+    const appendErrorTask = (title, type, target, msg) => {
+        const id = `local-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+        setTasks(prev => [
+            ...prev,
+            {
+                id, title, type, target: target || '',
+                logs: [msg], status: 'failed', startedAt: Date.now(), endedAt: Date.now(),
+                service: selected,
+            }
+        ]);
+        setActiveTaskId(id);
+        setPanelMinimized(false);
+    };
+
+    const closeTask = (id) => {
+        const es = eventSourcesRef.current[id];
+        if (es) { es.close(); delete eventSourcesRef.current[id]; }
+        setTasks(prev => {
+            const next = prev.filter(t => t.id !== id);
+            if (id === activeTaskId) {
+                setActiveTaskId(next.length > 0 ? next[next.length - 1].id : null);
+            }
+            return next;
+        });
+    };
+
+    const clearFinishedTasks = () => {
+        setTasks(prev => {
+            const next = prev.filter(t => t.status === 'running');
+            if (!next.find(t => t.id === activeTaskId)) {
+                setActiveTaskId(next.length > 0 ? next[0].id : null);
+            }
+            return next;
+        });
+    };
+
+    const handleDeploy = async (host, pid) => {
+        if (!selectedFile) return;
+        saveArgsHistory(selected, appArgs);
+        const target = host && pid ? `${host}:${pid}` : 'all instances';
+        const title = `Deploy ${selectedFile.name} → ${target}`;
+        try {
+            let url = `/api/services/${selected}/deploy?file=${encodeURIComponent(selectedFile.name)}`;
+            if (appArgs) url += `&appArgs=${encodeURIComponent(appArgs)}`;
+            if (host && pid) url += `&host=${host}&pid=${pid}`;
+            const res = await fetch(url, {method: 'POST'});
+            const data = await res.json();
+            startLogStream(data.requestId, title, 'deploy', target);
+        } catch (e) {
+            appendErrorTask(title, 'deploy', target, "!! Network Error");
+        }
+    };
+
+    const handleRestart = async (host, pid) => {
+        if (!confirm(`Restart instance ${host}:${pid}?`)) return;
+        saveArgsHistory(selected, appArgs);
+        const target = `${host}:${pid}`;
+        const title = `Restart ${target}`;
+        try {
+            let restartUrl = `/api/services/${selected}/restart?host=${host}&pid=${pid}`;
+            if (appArgs) restartUrl += `&appArgs=${encodeURIComponent(appArgs)}`;
+            const res = await fetch(restartUrl, {method: 'POST'});
+            const data = await res.json();
+            startLogStream(data.requestId, title, 'restart', target);
+        } catch (e) {
+            appendErrorTask(title, 'restart', target, "!! Network Error");
+        }
+    };
+
+    const handleKill = async (host, pid) => {
+        if (!confirm(`Kill instance ${host}:${pid}?`)) return;
+        const target = `${host}:${pid}`;
+        const title = `Kill ${target}`;
+        try {
+            const res = await fetch(`/api/services/${selected}/kill?host=${host}&pid=${pid}`, {method: 'POST'});
+            const data = await res.json();
+            startLogStream(data.requestId, title, 'kill', target);
+        } catch (e) {
+            appendErrorTask(title, 'kill', target, "!! Network Error");
+        }
+    };
+
+    const handleRollback = async (host, pid) => {
+        if (!confirm(`Rollback instance ${host}:${pid} to previous version?`)) return;
+        const target = host && pid ? `${host}:${pid}` : 'all instances';
+        const title = `Rollback ${target}`;
+        try {
+            let url = `/api/services/${selected}/rollback`;
+            if (host && pid) url += `?host=${host}&pid=${pid}`;
+            const res = await fetch(url, {method: 'POST'});
+            const data = await res.json();
+            startLogStream(data.requestId, title, 'rollback', target);
+        } catch (e) {
+            appendErrorTask(title, 'rollback', target, "!! Network Error");
+        }
+    };
+
+    const toggleBatch = (name) => {
+        setBatchSelected(prev => {
+            const next = new Set(prev);
+            if (next.has(name)) next.delete(name);
+            else next.add(name);
+            return next;
+        });
+    };
+
+    const handleBatchDeploy = async () => {
+        if (batchSelected.size === 0 || !selectedFile) return;
+        if (!confirm(`Deploy ${selectedFile.name} to ${batchSelected.size} services?`)) return;
+        const target = `${batchSelected.size} services`;
+        const title = `Batch Deploy ${selectedFile.name} → ${target}`;
+        try {
+            let url = `/api/batch/deploy?services=${[...batchSelected].join(',')}&file=${encodeURIComponent(selectedFile.name)}`;
+            if (appArgs) url += `&appArgs=${encodeURIComponent(appArgs)}`;
+            const res = await fetch(url, {method: 'POST'});
+            const data = await res.json();
+            startLogStream(data.requestId, title, 'deploy', target);
+        } catch (e) {
+            appendErrorTask(title, 'deploy', target, "!! Network Error");
+        }
+    };
+
+    // Per-instance multi-select helpers
+    const toggleInst = (host, pid) => {
+        const key = `${host}|${pid}`;
+        setSelectedInsts(prev => {
+            const next = new Set(prev);
+            if (next.has(key)) next.delete(key);
+            else next.add(key);
+            return next;
+        });
+    };
+
+    const toggleAllInsts = () => {
+        const insts = detail?.instances || [];
+        if (selectedInsts.size === insts.length && insts.length > 0) {
+            setSelectedInsts(new Set());
+        } else {
+            setSelectedInsts(new Set(insts.map(i => `${i.host}|${i.pid}`)));
+        }
+    };
+
+    const handleDeploySelectedInsts = async () => {
+        if (!selectedFile || selectedInsts.size === 0) return;
+        if (!confirm(`Deploy ${selectedFile.name} to ${selectedInsts.size} selected instance(s)?`)) return;
+        saveArgsHistory(selected, appArgs);
+        for (const key of selectedInsts) {
+            const [host, pidStr] = key.split('|');
+            const pid = parseInt(pidStr, 10);
+            // fire each in parallel; each gets its own task/tab
+            handleDeploy(host, pid);
+        }
+        setSelectedInsts(new Set());
+    };
+
+    // Filter + group services
+    const query = searchQuery.toLowerCase().trim();
+    const groupedServices = {};
+    (services || []).filter(svc =>
+        !query || svc.name.toLowerCase().includes(query) || (svc.group || '').toLowerCase().includes(query)
+    ).forEach(svc => {
+        const g = svc.group || 'default';
+        if (!groupedServices[g]) groupedServices[g] = [];
+        groupedServices[g].push(svc);
+    });
+
+    return (
+        <div className="flex h-screen">
+            {/* Sidebar - Service List */}
+            <div className="w-72 bg-white dark:bg-slate-800 border-r border-gray-200 dark:border-slate-700 flex flex-col">
+                <div className="p-4 border-b border-gray-200 dark:border-slate-700 flex items-center justify-between">
+                    <div>
+                        <h1 className="text-lg font-black text-blue-600 dark:text-blue-500 italic tracking-tight">Deployer</h1>
+                        <p className="mono text-[9px] opacity-40 uppercase tracking-[0.2em] mt-1">Control Plane</p>
+                    </div>
+                    <div className="flex items-center gap-2">
+                        <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded border ${isAdmin ? 'text-blue-500 border-blue-500/30 bg-blue-500/10' : 'text-gray-400 border-gray-300 dark:border-slate-600 bg-gray-100 dark:bg-slate-800'}">{isAdmin ? 'Admin' : 'Guest'}</span>
+                        <button
+                            type="button"
+                            onClick={() => {
+                                const xhr = new XMLHttpRequest();
+                                xhr.open('GET', '/api/role', true, '_logout', '_logout');
+                                xhr.onloadend = () => location.replace('/');
+                                xhr.send();
+                            }}
+                            className="text-[10px] text-gray-400 hover:text-red-500 transition-colors"
+                        >Logout</button>
+                        <button
+                            type="button"
+                            onClick={() => setDarkMode(!darkMode)}
+                            className="p-2 w-8 h-8 rounded-full border border-gray-200 dark:border-slate-700 bg-gray-50 dark:bg-slate-900 flex items-center justify-center transition-all shadow-sm hover:scale-110 text-sm"
+                        >
+                            {darkMode ? "☀️" : "🌙"}
+                        </button>
+                    </div>
+                </div>
+                <div className="px-2 pt-2">
+                    <input
+                        type="text"
+                        placeholder="Search services..."
+                        value={searchQuery}
+                        onChange={(e) => setSearchQuery(e.target.value)}
+                        className="w-full bg-gray-100 dark:bg-slate-900 border border-gray-200 dark:border-slate-700 rounded-lg px-3 py-1.5 text-xs outline-none focus:border-blue-500 transition-colors mono placeholder-gray-400 dark:placeholder-slate-600"
+                    />
+                </div>
+                <div className="flex-1 overflow-y-auto custom-scrollbar p-2">
+                    {Object.keys(groupedServices).length === 0 && (
+                        <div className="text-center text-gray-400 dark:text-slate-500 text-xs mt-8">
+                            {services.length === 0 ? 'No services registered' : 'No matches'}
+                        </div>
+                    )}
+                    {Object.entries(groupedServices).map(([group, svcs]) => (
+                        <div key={group} className="mb-3">
+                            <div
+                                className="px-2 py-1.5 flex items-center justify-between cursor-pointer hover:bg-gray-100 dark:hover:bg-slate-700/30 rounded transition-colors"
+                                onClick={() => setCollapsedGroups(prev => {
+                                    const next = new Set(prev);
+                                    if (next.has(group)) next.delete(group);
+                                    else next.add(group);
+                                    return next;
+                                })}
+                            >
+                                <span className="text-[9px] font-bold uppercase tracking-widest text-gray-400 dark:text-slate-600">{group}</span>
+                                <div className="flex items-center gap-1.5">
+                                    <span className="text-[9px] mono text-gray-400 dark:text-slate-600">{svcs.length}</span>
+                                    <svg className={`w-3 h-3 text-gray-400 dark:text-slate-600 transition-transform ${collapsedGroups.has(group) ? '' : 'rotate-90'}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 5l7 7-7 7"/>
+                                    </svg>
+                                </div>
+                            </div>
+                            {!collapsedGroups.has(group) && svcs.map(svc => (
+                                <div
+                                    key={svc.name}
+                                    className={`p-3 rounded-xl mb-1 cursor-pointer transition-all flex items-center gap-2 ${selected === svc.name ? 'bg-blue-100 dark:bg-blue-600/20 border border-blue-300 dark:border-blue-500/30' : 'hover:bg-gray-100 dark:hover:bg-slate-700/50'}`}
+                                >
+                                    <input
+                                        type="checkbox"
+                                        checked={batchSelected.has(svc.name)}
+                                        onChange={(e) => { e.stopPropagation(); toggleBatch(svc.name); }}
+                                        onClick={(e) => e.stopPropagation()}
+                                        className="w-3.5 h-3.5 rounded accent-blue-500 flex-shrink-0"
+                                    />
+                                    <div className="flex-1 min-w-0" onClick={() => selectService(svc.name)}>
+                                        <div className="flex items-center justify-between">
+                                            <span className="font-bold text-sm truncate">{svc.name}</span>
+                                            <span className="text-[10px] px-2 py-0.5 rounded-full bg-green-100 dark:bg-green-500/20 text-green-600 dark:text-green-400 mono flex-shrink-0">
+                                                {svc.instances?.length || 0}
+                                            </span>
+                                        </div>
+                                        <div className="text-[10px] text-gray-400 dark:text-slate-500 mt-1 mono truncate">
+                                            {svc.instances?.map(i => i.host).filter((v,i,a) => a.indexOf(v) === i).join(', ')}
+                                        </div>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    ))}
+                </div>
+
+                {/* Batch Deploy Button */}
+                {batchSelected.size > 0 && selectedFile && (
+                    <div className="p-2 border-t border-gray-200 dark:border-slate-700">
+                        <button
+                            onClick={handleBatchDeploy}
+                            className="w-full py-2.5 rounded-xl text-[11px] font-bold uppercase tracking-wider bg-blue-600 hover:bg-blue-500 text-white transition-all"
+                        >
+                            Batch Deploy ({batchSelected.size})
+                        </button>
+                    </div>
+                )}
+            </div>
+
+            {/* Main Content */}
+            <div className="flex-1 overflow-y-auto custom-scrollbar">
+                {!selected ? (
+                    <div className="flex items-center justify-center h-full text-gray-400 dark:text-slate-600">
+                        <div className="text-center">
+                            <svg className="w-16 h-16 mx-auto mb-4 opacity-30" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1" d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z" />
+                            </svg>
+                            <p className="text-sm">Select a service to manage</p>
+                        </div>
+                    </div>
+                ) : (
+                    <div className="p-6">
+                        {/* Header */}
+                        <div className="flex items-center justify-between mb-6">
+                            <div>
+                                <h2 className="text-2xl font-black text-blue-600 dark:text-blue-500 italic">{selected}</h2>
+                                {detail?.binaryDir && (
+                                    <span className="mono text-[11px] text-gray-500 dark:text-slate-500">CDN: {detail.binaryDir}</span>
+                                )}
+                            </div>
+                        </div>
+
+                        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
+                            {/* File Selector */}
+                            {isAdmin && detail?.binaryDir && files.length > 0 && (
+                                <div className="lg:col-span-3 bg-white dark:bg-slate-800 border border-gray-200 dark:border-slate-700 p-5 rounded-2xl">
+                                    <div className="flex justify-between items-center mb-3">
+                                        <div className="flex items-center gap-2">
+                                            <label className="text-[10px] font-bold text-blue-500 uppercase tracking-wider">Select Binary</label>
+                                            <span className="text-[10px] text-gray-400 dark:text-slate-500 mono">({files.length})</span>
+                                        </div>
+                                        <button onClick={() => loadFiles(selected)} className="text-[10px] text-gray-400 hover:text-blue-500 transition-colors">Refresh</button>
+                                    </div>
+                                    <div className="grid gap-1.5 max-h-[320px] overflow-y-auto pr-1 custom-scrollbar"
+                                         style={{gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))'}}>
+                                        {files.map(f => (
+                                            <div
+                                                key={f.hash}
+                                                onClick={() => setSelectedFile(f)}
+                                                className={`p-2.5 rounded-lg border cursor-pointer transition-all flex justify-between items-start gap-2 ${selectedFile?.hash === f.hash ? 'border-blue-500 bg-blue-50 dark:bg-blue-600/10' : 'border-transparent bg-gray-50 dark:bg-slate-900/40 hover:border-gray-300 dark:hover:border-slate-600'}`}
+                                            >
+                                                <span className="mono text-xs break-all min-w-0 flex-1" title={f.name}>{f.name}</span>
+                                                {isAdmin && (
+                                                <div className="flex gap-2 flex-shrink-0 pt-0.5" onClick={(e) => e.stopPropagation()}>
+                                                    <button onClick={() => {navigator.clipboard.writeText(`${location.origin}/cdn/d/${detail.binaryDir}/${f.hash}`); showToast('Link copied!');}}
+                                                        className="text-[10px] text-gray-400 hover:text-blue-500 transition-colors">Copy</button>
+                                                    <a href={`/cdn/d/${detail.binaryDir}/${f.hash}`} download
+                                                        className="text-[10px] text-gray-400 hover:text-blue-500 transition-colors">Download</a>
+                                                    <button onClick={async () => {
+                                                        if (!confirm(`Delete ${f.name}?`)) return;
+                                                        await fetch(`/api/cdn/file?dir=${detail.binaryDir}&file=${encodeURIComponent(f.name)}`, {method: 'DELETE'});
+                                                        setFiles(prev => prev.filter(x => x.hash !== f.hash));
+                                                        if (selectedFile?.hash === f.hash) setSelectedFile(null);
+                                                        showToast('Deleted');
+                                                    }} className="text-[10px] text-gray-400 hover:text-red-500 transition-colors">Delete</button>
+                                                </div>
+                                                )}
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* AppArgs Override (admin only) */}
+                            {isAdmin && (
+                            <div className="lg:col-span-3 bg-white dark:bg-slate-800 border border-gray-200 dark:border-slate-700 p-4 rounded-2xl">
+                                <label className="text-[10px] font-bold text-blue-500 uppercase mb-2 block tracking-wider">App Args (optional, overrides agent default)</label>
+                                <input
+                                    type="text"
+                                    className="w-full bg-gray-50 dark:bg-slate-900 border border-gray-200 dark:border-slate-700 p-2 rounded mono text-xs outline-none focus:border-blue-500"
+                                    placeholder=""
+                                    value={appArgs}
+                                    onChange={(e) => setAppArgs(e.target.value)}
+                                />
+                                {argsHistory.length > 0 && (
+                                    <div className="mt-2 flex flex-wrap gap-1.5">
+                                        {argsHistory.map((h, i) => (
+                                            <span key={i} className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-gray-100 dark:bg-slate-700 mono text-[11px] text-gray-600 dark:text-slate-300 cursor-pointer hover:bg-blue-100 dark:hover:bg-blue-600/20 transition-colors"
+                                                onClick={() => setAppArgs(h)}>
+                                                {h.length > 50 ? h.substring(0, 50) + '...' : h}
+                                                <span className="text-gray-400 hover:text-red-500 ml-0.5" onClick={(e) => { e.stopPropagation(); removeArgsHistory(selected, h); }}>&times;</span>
+                                            </span>
+                                        ))}
+                                    </div>
+                                )}
+                            </div>
+                            )}
+
+                            {/* Instances Table */}
+                            <div className="lg:col-span-3 bg-white dark:bg-slate-800 border border-gray-200 dark:border-slate-700 rounded-2xl overflow-hidden">
+                                <div className="p-4 border-b border-gray-100 dark:border-slate-700 flex justify-between items-center gap-3">
+                                    <div className="flex items-center gap-3">
+                                        <span className="text-xs font-bold uppercase opacity-50 tracking-wide">Instances</span>
+                                        <span className="text-[10px] px-2 py-0.5 rounded bg-blue-500/10 text-blue-500 border border-blue-500/20 mono">
+                                            {detail?.instances?.length || 0} running
+                                        </span>
+                                        {selectedInsts.size > 0 && (
+                                            <span className="text-[10px] px-2 py-0.5 rounded bg-purple-500/10 text-purple-500 border border-purple-500/20 mono">
+                                                {selectedInsts.size} selected
+                                            </span>
+                                        )}
+                                    </div>
+                                    {isAdmin && selectedInsts.size > 0 && (
+                                        <div className="flex gap-2">
+                                            <button onClick={() => setSelectedInsts(new Set())}
+                                                className="px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase text-gray-500 dark:text-slate-400 border border-gray-300 dark:border-slate-600 hover:bg-gray-100 dark:hover:bg-slate-700 transition-all">
+                                                Clear
+                                            </button>
+                                            <button onClick={handleDeploySelectedInsts}
+                                                disabled={!selectedFile}
+                                                className="px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase bg-blue-600 hover:bg-blue-500 text-white disabled:opacity-40 disabled:cursor-not-allowed transition-all">
+                                                Deploy Selected ({selectedInsts.size})
+                                            </button>
+                                        </div>
+                                    )}
+                                </div>
+                                <div className="overflow-x-auto">
+                                    <table className="w-full">
+                                        <thead className="bg-gray-50 dark:bg-slate-900/50 text-[10px] font-bold uppercase text-gray-400 dark:text-slate-500">
+                                        <tr>
+                                            {isAdmin && (
+                                                <th className="p-3 w-8 text-center">
+                                                    <input
+                                                        type="checkbox"
+                                                        checked={(detail?.instances?.length > 0) && selectedInsts.size === detail.instances.length}
+                                                        onChange={toggleAllInsts}
+                                                        className="w-3.5 h-3.5 rounded accent-blue-500"
+                                                    />
+                                                </th>
+                                            )}
+                                            <th className="p-3 text-left">Host</th>
+                                            <th className="p-3 text-center">CC</th>
+                                            <th className="p-3 text-center">PID</th>
+                                            <th className="p-3 text-center">Port</th>
+                                            <th className="p-3 text-center">Version</th>
+                                            <th className="p-3 text-center">Uptime</th>
+                                            <th className="p-3 text-right">Actions</th>
+                                        </tr>
+                                        </thead>
+                                        <tbody className="divide-y divide-gray-100 dark:divide-slate-700/50">
+                                        {detail?.instances?.map(inst => {
+                                            const instKey = `${inst.host}|${inst.pid}`;
+                                            const instChecked = selectedInsts.has(instKey);
+                                            return (
+                                            <tr key={`${inst.host}-${inst.pid}`} className={`hover:bg-gray-50 dark:hover:bg-slate-700/20 ${instChecked ? 'bg-blue-50/60 dark:bg-blue-600/10' : ''}`}>
+                                                {isAdmin && (
+                                                    <td className="p-3 text-center">
+                                                        <input
+                                                            type="checkbox"
+                                                            checked={instChecked}
+                                                            onChange={() => toggleInst(inst.host, inst.pid)}
+                                                            className="w-3.5 h-3.5 rounded accent-blue-500"
+                                                        />
+                                                    </td>
+                                                )}
+                                                <td className="p-3">
+                                                    <div className="flex items-center gap-2 cursor-pointer" onClick={() => setModalInst(inst)}>
+                                                        <span className="w-2 h-2 bg-green-500 rounded-full"></span>
+                                                        <div>
+                                                            <div className="mono text-xs hover:text-blue-500 transition-colors">{inst.host}</div>
+                                                            <div className="mono text-[10px] text-gray-400 dark:text-slate-500">{inst.remoteAddr}</div>
+                                                        </div>
+                                                    </div>
+                                                </td>
+                                                <td className="p-3 text-center mono text-xs text-gray-500 dark:text-slate-400">{inst.countryCode || '-'}</td>
+                                                <td className="p-3 text-center mono text-sm font-bold">{inst.pid}</td>
+                                                <td className="p-3 text-center mono text-xs text-gray-400 dark:text-slate-400">{inst.port}</td>
+                                                <td className="p-3 text-center">
+                                                    <span className="mono text-[10px] text-blue-500 bg-blue-500/10 px-2 py-0.5 rounded border border-blue-500/20">{inst.version}</span>
+                                                </td>
+                                                <td className="p-3 text-center mono text-xs text-blue-400">{inst.uptime}</td>
+                                                <td className="p-3 text-right">
+                                                    <div className="flex gap-1.5 justify-end flex-wrap">
+                                                        {isAdmin && (<>
+                                                        <button onClick={() => handleDeploy(inst.host, inst.pid)}
+                                                            disabled={!selectedFile}
+                                                            className="px-2.5 py-1 rounded text-[10px] font-bold uppercase text-blue-400 border border-blue-500/20 hover:bg-blue-500 hover:text-white disabled:opacity-30 disabled:cursor-not-allowed transition-all">
+                                                            Deploy
+                                                        </button>
+                                                        <button onClick={() => handleRollback(inst.host, inst.pid)}
+                                                            className="px-2.5 py-1 rounded text-[10px] font-bold uppercase text-purple-400 border border-purple-500/20 hover:bg-purple-500 hover:text-white transition-all">
+                                                            Rollback
+                                                        </button>
+                                                        <button onClick={() => handleRestart(inst.host, inst.pid)}
+                                                            className="px-2.5 py-1 rounded text-[10px] font-bold uppercase text-yellow-400 border border-yellow-500/20 hover:bg-yellow-500 hover:text-black transition-all">
+                                                            Restart
+                                                        </button>
+                                                        <button onClick={() => handleKill(inst.host, inst.pid)}
+                                                            className="px-2.5 py-1 rounded text-[10px] font-bold uppercase text-red-400 border border-red-500/20 hover:bg-red-500 hover:text-white transition-all">
+                                                            Kill
+                                                        </button>
+                                                        <a href={`/terminal?service=${selected}&host=${inst.host}&pid=${inst.pid}`}
+                                                            target="_blank"
+                                                            className="px-2.5 py-1 rounded text-[10px] font-bold uppercase text-green-400 border border-green-500/20 hover:bg-green-600 hover:text-white transition-all inline-block">
+                                                            Terminal
+                                                        </a>
+                                                        </>)}
+                                                    </div>
+                                                </td>
+                                            </tr>
+                                        );})}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </div>
+
+                        {/* Resource Monitor */}
+                        {resources.length > 0 && (
+                            <div className="mb-6 bg-white dark:bg-slate-800 border border-gray-200 dark:border-slate-700 rounded-2xl overflow-hidden">
+                                <div className="p-4 border-b border-gray-100 dark:border-slate-700">
+                                    <span className="text-xs font-bold uppercase opacity-50 tracking-wide">Resource Monitor</span>
+                                    <span className="text-[9px] text-gray-400 dark:text-slate-600 ml-2">real-time</span>
+                                </div>
+                                <div className="p-4 space-y-4">
+                                    {[...resources].sort((a, b) => a.host.localeCompare(b.host) || a.pid - b.pid).map(r => (
+                                        <div key={`${r.host}-${r.pid}`} className="flex items-center gap-4">
+                                            <div className="w-40 flex-shrink-0">
+                                                <div className="mono text-xs font-bold">{r.host}</div>
+                                                <div className="mono text-[10px] text-gray-400 dark:text-slate-500">{r.remoteAddr}</div>
+                                                <div className="mono text-[10px] text-gray-400 dark:text-slate-500">PID: {r.pid}</div>
+                                            </div>
+                                            {/* CPU */}
+                                            <div className="flex-1">
+                                                <div className="flex justify-between text-[10px] mb-1">
+                                                    <span className="text-gray-500 dark:text-slate-400">CPU</span>
+                                                    <span className="mono font-bold">{r.cpuPercent.toFixed(1)}%</span>
+                                                </div>
+                                                <div className="h-2 bg-gray-100 dark:bg-slate-700 rounded-full overflow-hidden">
+                                                    <div className={`h-full rounded-full transition-all duration-500 ${r.cpuPercent > 80 ? 'bg-red-500' : r.cpuPercent > 50 ? 'bg-yellow-500' : 'bg-green-500'}`}
+                                                        style={{width: `${Math.min(r.cpuPercent, 100)}%`}}></div>
+                                                </div>
+                                            </div>
+                                            {/* Memory */}
+                                            {(() => {
+                                                const fmt = (v) => v >= 1073741824 ? (v / 1073741824).toFixed(1) + ' GB' : (v / 1048576).toFixed(0) + ' MB';
+                                                const appPct = r.memTotal > 0 ? (r.memRSS / r.memTotal * 100) : 0;
+                                                const sysPct = r.memTotal > 0 ? (r.memUsed / r.memTotal * 100) : 0;
+                                                return (
+                                                    <div className="flex-1 space-y-1.5">
+                                                        <div>
+                                                            <div className="flex justify-between text-[10px] mb-0.5">
+                                                                <span className="text-gray-500 dark:text-slate-400">App</span>
+                                                                <span className="mono font-bold">{fmt(r.memRSS)}</span>
+                                                            </div>
+                                                            <div className="h-1.5 bg-gray-100 dark:bg-slate-700 rounded-full overflow-hidden">
+                                                                <div className="h-full rounded-full transition-all duration-500 bg-blue-500"
+                                                                    style={{width: `${Math.min(appPct, 100)}%`}}></div>
+                                                            </div>
+                                                        </div>
+                                                        <div>
+                                                            <div className="flex justify-between text-[10px] mb-0.5">
+                                                                <span className="text-gray-500 dark:text-slate-400">System</span>
+                                                                <span className="mono font-bold">{fmt(r.memUsed)} / {fmt(r.memTotal)} ({sysPct.toFixed(0)}%)</span>
+                                                            </div>
+                                                            <div className="h-1.5 bg-gray-100 dark:bg-slate-700 rounded-full overflow-hidden">
+                                                                <div className={`h-full rounded-full transition-all duration-500 ${sysPct > 80 ? 'bg-red-500' : sysPct > 50 ? 'bg-yellow-500' : 'bg-green-500'}`}
+                                                                    style={{width: `${Math.min(sysPct, 100)}%`}}></div>
+                                                            </div>
+                                                        </div>
+                                                    </div>
+                                                );
+                                            })()}
+                                            {/* Goroutines */}
+                                            <div className="w-24 text-center flex-shrink-0">
+                                                <div className="text-[10px] text-gray-500 dark:text-slate-400">Goroutines</div>
+                                                <div className="mono text-lg font-bold text-purple-500">{r.numGoroutine}</div>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+
+                        {/* Deploy All Button (admin only) */}
+                        {isAdmin && selectedFile && (
+                            <button
+                                onClick={() => handleDeploy()}
+                                disabled={!selectedFile}
+                                className={`w-full py-4 rounded-2xl font-bold uppercase tracking-[0.15em] text-sm transition-all flex items-center justify-center gap-3 shadow-xl mb-6
+                                    ${!selectedFile ? 'bg-gray-200 dark:bg-slate-800 text-gray-400 dark:text-slate-600' : 'bg-blue-600 hover:bg-blue-500 text-white active:scale-[0.99]'}`}
+                            >
+                                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 10V3L4 14h7v7l9-11h-7z"/>
+                                </svg>
+                                <span>{`Deploy ${selectedFile.name} to All Instances`}</span>
+                            </button>
+                        )}
+
+
+
+                        {/* Instance Detail Modal */}
+                        {modalInst && (
+                            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={() => setModalInst(null)}>
+                                <div className="bg-white dark:bg-slate-800 border border-gray-200 dark:border-slate-700 rounded-2xl shadow-2xl w-full max-w-lg mx-4" onClick={e => e.stopPropagation()}>
+                                    <div className="flex justify-between items-center p-5 border-b border-gray-100 dark:border-slate-700">
+                                        <h3 className="font-bold text-sm">Instance Detail</h3>
+                                        <button onClick={() => setModalInst(null)} className="text-gray-400 hover:text-gray-600 dark:hover:text-white text-lg">&times;</button>
+                                    </div>
+                                    <div className="p-5 space-y-3 mono text-xs">
+                                        {[
+                                            ['Host', modalInst.host],
+                                            ['Remote IP', modalInst.remoteAddr || '-'],
+                                            ['Country', modalInst.countryCode || '-'],
+                                            ['PID', modalInst.pid],
+                                            ['Port', modalInst.port],
+                                            ['Version', modalInst.version],
+                                            ['Build Hash', modalInst.commitHash || '-'],
+                                            ['Build Time', modalInst.commitTime || '-'],
+                                            ['Go Version', modalInst.goVersion || '-'],
+                                            ['Start Time', modalInst.startTimeMs ? new Date(modalInst.startTimeMs).toLocaleString() : '-'],
+                                            ['Uptime', modalInst.uptime],
+                                        ].map(([label, value]) => (
+                                            <div key={label} className="flex">
+                                                <span className="w-28 text-gray-400 dark:text-slate-500 flex-shrink-0">{label}</span>
+                                                <span className="font-medium break-all">{value}</span>
+                                            </div>
+                                        ))}
+                                        <div className="pt-2 border-t border-gray-100 dark:border-slate-700">
+                                            <div className="text-gray-400 dark:text-slate-500 mb-1.5">Command</div>
+                                            <div className="bg-gray-900 text-green-400 p-3 rounded-lg text-[11px] break-all">
+                                                {modalInst.exePath}{modalInst.appArgs ? ' ' + modalInst.appArgs : ''}
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
+                        {/* spacer so content isn't hidden by the floating task panel */}
+                        {tasks.length > 0 && !panelMinimized && <div className="h-[360px]"/>}
+                    </div>
+                )}
+            </div>
+
+            {/* Floating Task Panel (tabbed, concurrent, non-blocking) */}
+            <TaskPanel
+                tasks={tasks}
+                activeTaskId={activeTaskId}
+                setActiveTaskId={setActiveTaskId}
+                closeTask={closeTask}
+                clearFinishedTasks={clearFinishedTasks}
+                minimized={panelMinimized}
+                setMinimized={setPanelMinimized}
+                runningCount={runningCount}
+                logBodyRef={logBodyRef}
+            />
+
+            {toast && (
+                <div className="fixed bottom-6 left-1/2 -translate-x-1/2 bg-gray-800 text-white text-sm px-4 py-2 rounded-lg shadow-lg z-50">
+                    {toast}
+                </div>
+            )}
+        </div>
+    );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App/>);
+</script>
+</body>
+</html>
